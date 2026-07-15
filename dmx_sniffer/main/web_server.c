@@ -676,32 +676,30 @@ static esp_err_t api_dmx_channels_handler(httpd_req_t *req) {
 
 /** GET /api/led_preview — текущие цвета LED-ленты (N×3 байта: R,G,B на пиксель) */
 static esp_err_t api_led_preview_handler(httpd_req_t *req) {
-    size_t alloc = (size_t)LED_STRIP_MAX_LEDS * 3;
-    uint8_t *buf = malloc(alloc);
-    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
+    static uint8_t preview_buf[LED_STRIP_MAX_LEDS * 3];
 
     led_strip_lock();
     uint16_t n = g_led_strip.count;
     if (n > LED_STRIP_MAX_LEDS) n = LED_STRIP_MAX_LEDS;
     for (uint16_t i = 0; i < n; i++) {
-        buf[i * 3 + 0] = g_led_strip.colors[i].r;
-        buf[i * 3 + 1] = g_led_strip.colors[i].g;
-        buf[i * 3 + 2] = g_led_strip.colors[i].b;
+        preview_buf[i * 3 + 0] = g_led_strip.colors[i].r;
+        preview_buf[i * 3 + 1] = g_led_strip.colors[i].g;
+        preview_buf[i * 3 + 2] = g_led_strip.colors[i].b;
     }
     led_strip_unlock();
 
     httpd_resp_set_type(req, "application/octet-stream");
-    esp_err_t ret = httpd_resp_send(req, (const char *)buf, n * 3);
-    free(buf);
-    return ret;
+    return httpd_resp_send(req, (const char *)preview_buf, n * 3);
 }
 
 /**
  * GET /api/blob — все данные одним блобом
  * Формат: [DMX port0: 512B][DMX port1: 512B][fixture_colors: count×3B]
- * Всего: 1024 + count*3 байт
+ * Всего: 1024 + count*3 байт (макс 2044)
  */
 static esp_err_t api_blob_handler(httpd_req_t *req) {
+    static uint8_t blob[2048];
+
     uint8_t dmx[DMX_CHANNELS * 2];
     for (int p = 0; p < 2; p++)
         dmx_get_channel_data(p, dmx + p * DMX_CHANNELS, DMX_CHANNELS);
@@ -715,15 +713,11 @@ static esp_err_t api_blob_handler(httpd_req_t *req) {
     dmx_unlock();
 
     size_t total = sizeof(dmx) + n_fix * 3;
-    uint8_t *blob = malloc(total);
-    if (!blob) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_FAIL; }
     memcpy(blob, dmx, sizeof(dmx));
     memcpy(blob + sizeof(dmx), fc, n_fix * 3);
 
     httpd_resp_set_type(req, "application/octet-stream");
-    esp_err_t ret = httpd_resp_send(req, (const char *)blob, total);
-    free(blob);
-    return ret;
+    return httpd_resp_send(req, (const char *)blob, total);
 }
 
 /** POST /api/interpolate — включить/выключить интерполяцию цветов */

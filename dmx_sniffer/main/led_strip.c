@@ -27,8 +27,6 @@ static const char *TAG = "LED_STRIP";
 led_strip_t g_led_strip;
 
 static rmt_encoder_handle_t s_led_encoder = NULL;
-static rmt_encoder_handle_t s_bytes_encoder = NULL;
-static rmt_encoder_handle_t s_copy_encoder = NULL;
 
 static SemaphoreHandle_t s_colors_mutex = NULL;
 
