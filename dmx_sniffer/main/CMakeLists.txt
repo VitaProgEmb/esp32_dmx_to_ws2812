@@ -1,0 +1,23 @@
+idf_component_register(SRCS
+    "main.c"
+    "dmx.c"
+    "dmx_hal.c"
+    "uart_bypass.c"
+    "led_strip.c"   
+    "patch_manager.c"
+    "wifi_ap.c"
+    "web_server.c"
+    "settings_manager.c"
+    "debug_server.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        esp_wifi
+        esp_event
+        nvs_flash
+        esp_http_server
+        spiffs
+        json
+        esp_timer
+        app_update
+)

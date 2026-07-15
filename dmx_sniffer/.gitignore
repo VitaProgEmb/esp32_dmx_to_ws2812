@@ -1,0 +1,5 @@
+build/
+sdkconfig.old
+*.pyc
+__pycache__/
+.vscode/
