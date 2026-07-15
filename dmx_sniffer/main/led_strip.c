@@ -71,6 +71,7 @@ static size_t rmt_encode_led_strip(rmt_encoder_t *encoder, rmt_channel_handle_t 
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        /* falls through */
     case 1:
         encoded_symbols += copy_enc->encode(copy_enc, channel, &led_enc->reset_code,
                                             sizeof(led_enc->reset_code), &session_state);
