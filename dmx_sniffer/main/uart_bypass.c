@@ -1,6 +1,7 @@
 #include "uart_bypass.h"
 #include "settings.h"
 #include "esp_attr.h"
+#include "esp_intr_alloc.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -10,12 +11,39 @@
 #include "esp_timer.h"
 #include "dmx_hal.h"
 #include "dmx.h"
+#include <string.h>
 
 static const char *TAG = "UART_BYPASS";
 
 #define UART_BAUD_RATE  250000
 #define UART_RX_BUF     4096
 #define UART_TX_BUF     1024
+
+/* ======================================================================
+ * АДРЕСА РЕГИСТРОВ UART (ESP32)
+ * ======================================================================
+ * Используются для безопасного сброса FIFO через portENTER_CRITICAL.
+ *
+ * [CPU-3.21]: прямое чтение FIFO-регистра во время прерывания на другом
+ * UART вызывает зависание APB-шины. Решение — блокировать прерывания
+ * на ТЕКУЩЕМ ядре (portENTER_CRITICAL) при обращении к FIFO.
+ * ====================================================================== */
+
+#define UART1_BASE_ADDR 0x3FF50000
+#define UART2_BASE_ADDR 0x3FF6E000
+
+#define UART_STATUS_REG_OFF  0x1C
+#define UART_FIFO_REG_OFF    0x00
+#define UART_RXFIFO_CNT_MASK 0x1F
+
+#define UART_GET_BASE(uart_num) \
+    ((uart_num) == UART_NUM_1 ? UART1_BASE_ADDR : UART2_BASE_ADDR)
+
+#define UART_READ_REG(base, off) (*(volatile uint32_t *)((base) + (off)))
+
+/* ======================================================================
+ * КОНТЕКСТ UART
+ * ====================================================================== */
 
 typedef struct {
     uart_port_t uart_num;
@@ -44,9 +72,50 @@ typedef struct {
     TaskHandle_t event_task;
 
     QueueHandle_t uart_queue;
+
+    uint32_t base_addr;             /* Базовый адрес регистров UART */
+    portMUX_TYPE fifo_mux;          /* Spinlock для безопасного сброса FIFO */
 } hw_uart_ctx_t;
 
 static hw_uart_ctx_t s_ctx[2];
+
+/* ======================================================================
+ * БЕЗОПАСНЫЙ СБРОС FIFO
+ * ======================================================================
+ *
+ * Замена uart_flush_input() которая сама читает FIFO без критической
+ * секции (см. uart_ll_rxfifo_rst в uart_ll.h:370).
+ *
+ * Наша версия:
+ *   1. portENTER_CRITICAL — блокирует прерывания на текущем ядре
+ *   2. Читает байты из FIFO-регистра (пока fifo_cnt > 0)
+ *   3. portEXIT_CRITICAL — восстанавливает прерывания
+ *
+ * Время выполнения: ~1-5 мкс (128 байт × ~40 нс за чтение)
+ * ====================================================================== */
+
+static void safe_fifo_drain(hw_uart_ctx_t *ctx) {
+    uint32_t base = ctx->base_addr;
+
+    portENTER_CRITICAL(&ctx->fifo_mux);
+    while (1) {
+        uint32_t status = UART_READ_REG(base, UART_STATUS_REG_OFF);
+        uint32_t fifo_cnt = status & UART_RXFIFO_CNT_MASK;
+        if (fifo_cnt == 0) break;
+        (void)UART_READ_REG(base, UART_FIFO_REG_OFF);
+    }
+    portEXIT_CRITICAL(&ctx->fifo_mux);
+}
+
+/* ======================================================================
+ * EVENT TASK (ESP-IDF UART driver)
+ * ======================================================================
+ *
+ * Используем стандартный event-driven подход ESP-IDF, но:
+ *   - uart_flush_input() заменён на safe_fifo_drain()
+ *   - Вместо uart_flush_input() + xQueueReset используем
+ *     safe_fifo_drain() + xQueueReset()
+ * ====================================================================== */
 
 static void uart_event_task(void *arg) {
     int port = (int)arg;
@@ -80,7 +149,7 @@ static void uart_event_task(void *arg) {
             case UART_BREAK: {
                 int64_t now = esp_timer_get_time();
                 if (now - ctx->last_break_us < 1000) {
-                    uart_flush_input(ctx->uart_num);
+                    safe_fifo_drain(ctx);
                     xQueueReset(ctx->uart_queue);
                     break;
                 }
@@ -94,7 +163,7 @@ static void uart_event_task(void *arg) {
                 ctx->rx_head = 0;
                 ctx->in_frame = false;
                 ctx->seen_break = true;
-                uart_flush_input(ctx->uart_num);
+                safe_fifo_drain(ctx);
                 xQueueReset(ctx->uart_queue);
                 break;
             }
@@ -103,7 +172,7 @@ static void uart_event_task(void *arg) {
                 break;
             case UART_FIFO_OVF:
                 ctx->ovf_count++;
-                uart_flush_input(ctx->uart_num);
+                safe_fifo_drain(ctx);
                 xQueueReset(ctx->uart_queue);
                 ctx->rx_head = 0;
                 ctx->in_frame = false;
@@ -114,6 +183,10 @@ static void uart_event_task(void *arg) {
         }
     }
 }
+
+/* ======================================================================
+ * НАСТРОЙКА UART
+ * ====================================================================== */
 
 static void configure_uart(int port) {
     hw_uart_ctx_t *ctx = &s_ctx[port];
@@ -138,6 +211,10 @@ static void configure_uart(int port) {
     gpio_set_pull_mode(ctx->gpio_rx, GPIO_FLOATING);
 }
 
+/* ======================================================================
+ * ПУБЛИЧНЫЕ ФУНКЦИИ
+ * ====================================================================== */
+
 void uart_bypass_init(int port) {
     hw_uart_ctx_t *ctx = &s_ctx[port];
 
@@ -145,10 +222,12 @@ void uart_bypass_init(int port) {
         ctx->uart_num = UART_NUM_1;
         ctx->gpio_rx = DMX_GPIO_RX1;
         ctx->gpio_tx = DMX_GPIO_TX1;
+        ctx->base_addr = UART1_BASE_ADDR;
     } else {
         ctx->uart_num = UART_NUM_2;
-        ctx->gpio_rx = DMX_GPIO_RX2;  // UART2 on GPIO16 (COM6)
+        ctx->gpio_rx = DMX_GPIO_RX2;
         ctx->gpio_tx = DMX_GPIO_TX2;
+        ctx->base_addr = UART2_BASE_ADDR;
     }
 
     ctx->rx_head = 0;
@@ -161,6 +240,11 @@ void uart_bypass_init(int port) {
     ctx->ovf_count = 0;
     ctx->last_break_us = 0;
     ctx->seen_break = false;
+    ctx->notify_task = NULL;
+    ctx->event_task = NULL;
+    ctx->uart_queue = NULL;
+
+    portMUX_INITIALIZE(&ctx->fifo_mux);
 }
 
 void uart_bypass_init_all(void) {
@@ -183,10 +267,12 @@ void uart_bypass_start_timer(void) {
     configure_uart(1);
 
     TaskHandle_t evt0 = NULL, evt1 = NULL;
-    xTaskCreatePinnedToCore(uart_event_task, "uart0_evt", 8192, (void*)0, 5, &evt0, 1);
+    xTaskCreatePinnedToCore(uart_event_task, "uart0_evt", 8192, (void*)0, 5, &evt0, 0);
     xTaskCreatePinnedToCore(uart_event_task, "uart1_evt", 8192, (void*)1, 5, &evt1, 1);
     s_ctx[0].event_task = evt0;
     s_ctx[1].event_task = evt1;
+
+    ESP_LOGI(TAG, "UART event tasks started on different cores (0,1)");
 }
 
 void uart_bypass_set_notify_task(int port, TaskHandle_t handle) {
@@ -202,10 +288,10 @@ void uart_bypass_set_tx_mode(int port, bool tx_mode) {
     hw_uart_ctx_t *ctx = &s_ctx[port];
     if (tx_mode) {
         if (ctx->event_task) vTaskSuspend(ctx->event_task);
-        uart_flush_input(ctx->uart_num);
+        safe_fifo_drain(ctx);
         xQueueReset(ctx->uart_queue);
     } else {
-        uart_flush_input(ctx->uart_num);
+        safe_fifo_drain(ctx);
         xQueueReset(ctx->uart_queue);
         ctx->rx_head = 0;
         ctx->in_frame = false;
@@ -214,15 +300,13 @@ void uart_bypass_set_tx_mode(int port, bool tx_mode) {
     }
 }
 
-bool uart_bypass_get_frame(int port, uint8_t *out, int max_len, uint32_t *frame_count) {
+bool uart_bypass_get_frame(int port, uint8_t *out, int max_len, uint32_t *frame_len) {
     hw_uart_ctx_t *ctx = &s_ctx[port];
     if (!ctx->frame_ready) return false;
-    __asm__ __volatile__("memw" ::: "memory");
+
     int len = (max_len < (int)ctx->last_frame_len) ? max_len : (int)ctx->last_frame_len;
-    for (int i = 0; i < len; i++) {
-        out[i] = ctx->rx_done[i];
-    }
-    *frame_count = ctx->frame_count;
+    memcpy(out, ctx->rx_done, len);
+    *frame_len = ctx->last_frame_len;
     ctx->frame_ready = false;
     return true;
 }
