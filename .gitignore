@@ -1,0 +1,8 @@
+node_modules/
+*.bin
+*.log
+build/
+sdkconfig
+sdkconfig.old
+.vscode/
+__pycache__/

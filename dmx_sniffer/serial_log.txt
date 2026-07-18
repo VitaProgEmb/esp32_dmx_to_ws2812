@@ -1,0 +1,44 @@
+.��镁: 4MB
+I (42) boot: Enabling RNG early entropy source...
+I (46) boot: Partition Table:
+I (49) boot: ## Label            Usage          Type ST Offset   Length
+I (55) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (62) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (68) boot:  2 factory          factory app      00 00 00010000 00300000
+I (75) boot:  3 storage          Unknown data     01 82 00310000 000f0000
+I (81) boot: End of partition table
+I (85) esp_image: segment 0: paddr=00010020 vaddr=3f400020 size=29aa0h (170656) map
+I (150) esp_image: segment 1: paddr=00039ac8 vaddr=3ffb0000 size=044a0h ( 17568) load
+I (157) esp_image: segment 2: paddr=0003df70 vaddr=40080000 size=020a8h (  8360) load
+I (161) esp_image: segment 3: paddr=00040020 vaddr=400d0020 size=9196ch (596332) map
+I (366) esp_image: segment 4: paddr=000d1994 vaddr=400820a8 size=167b0h ( 92080) load
+I (402) esp_image: segment 5: paddr=000e814c vaddr=50000000 size=00020h (    32) load
+I (414) boot: Loaded app from partition at offset 0x10000
+I (414) boot: Disabling RNG early entropy source...
+I (424) cpu_start: Multicore app
+I (433) cpu_start: GPIO 3 and 1 are used as console UART I/O pins
+I (433) cpu_start: Pro cpu start user code
+I (433) cpu_start: cpu freq: 240000000 Hz
+I (435) app_init: Application information:
+I (439) app_init: Project name:     dmx_sniffer
+I (443) app_init: App version:      1
+I (446) app_init: Compile time:     Jun 18 2026 18:24:38
+I (451) app_init: ELF file SHA256:  ba8ce9854...
+I (456) app_init: ESP-IDF:          v5.5.4
+I (459) efuse_init: Min chip rev:     v0.0
+I (463) efuse_init: Max chip rev:     v3.99 
+I (467) efuse_init: Chip rev:         v1.0
+I (471) heap_init: Initializing. RAM available for dynamic allocation:
+I (477) heap_init: At 3FFAE6E0 len 00001920 (6 KiB): DRAM
+I (482) heap_init: At 3FFC1C78 len 0001E388 (120 KiB): DRAM
+I (488) heap_init: At 3FFE0440 len 00003AE0 (14 KiB): D/IRAM
+I (493) heap_init: At 3FFE4350 len 0001BCB0 (111 KiB): D/IRAM
+I (499) heap_init: At 40098858 len 000077A8 (29 KiB): IRAM
+I (505) spi_flash: detected chip: generic
+I (508) spi_flash: flash io: dio
+I (511) main_task: Started on CPU0
+I (513) main_task: Calling app_main()
+I (516) MAIN: DMX Sniffer/Tester starting...
+I (550) SETTINGS: Settings loaded: speed0=250000 speed1=250000 max_ch=512 led=1000
+I (552) LED_STRIP: RMT TX channel initialized for 1000 LEDs on GPIO 23
+I (563) DMX: Installing dmx driver on port 0...

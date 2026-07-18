@@ -1,0 +1,7 @@
+
+Done! You can now compile ESP-IDF projects.
+Go to the project directory and run:
+
+  idf.py build
+
+Executing action: monitor

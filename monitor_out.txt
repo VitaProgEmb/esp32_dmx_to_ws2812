@@ -1,0 +1,10 @@
+
+Done! You can now compile ESP-IDF projects.
+Go to the project directory and run:
+
+  idf.py build
+
+Executing action: monitor
+Running idf_monitor in directory C:\DmxSnifer\dmx_sniffer
+Executing "C:\Espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe C:\Espressif\frameworks\esp-idf-v5.5.4\tools/idf_monitor.py -p COM3 -b 115200 --toolchain-prefix xtensa-esp32-elf- --target esp32 --revision 0 C:\DmxSnifer\dmx_sniffer\build\dmx_sniffer.elf C:\DmxSnifer\dmx_sniffer\build\bootloader\bootloader.elf --force-color -m 'C:\Espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe' 'C:\Espressif\frameworks\esp-idf-v5.5.4\tools\idf.py' '-p' 'COM3'"...
+e
