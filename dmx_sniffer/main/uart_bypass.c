@@ -54,9 +54,13 @@ typedef struct {
     volatile bool in_frame;
     uint32_t timeout_thresh;
     /* Decoder state (меж-batch) */
-    uint32_t byte_accum;
-    int bit_idx;
+    uint8_t nibble_phase;        /* 0=low nibble, 1=high nibble */
+    uint8_t current_byte;        /* собранный байт */
     int byte_count;
+    /* Carry buffer — остаток items между batch'ами */
+    uint8_t carry_pulses[8];
+    bool    carry_levels[8];
+    uint8_t carry_count;
 #endif
 
 #if DMX_SW_UART_MODE == 0
@@ -72,57 +76,6 @@ typedef struct {
 } sw_uart_ctx_t;
 
 static sw_uart_ctx_t s_ctx[2];
-
-/* ======================================================================
- * LUT: RMT TICKS → КОЛИЧЕСТВО БИТ (для RMT RX режима)
- * ======================================================================
- *
- * RMT клок = 1MHz → 1 тик = 1мкс
- * DMX 250kbaud → 1 бит = 4 мкс = 4 тика
- *
- * LUT индексируется: (duration_ticks) → биты
- * Макс. покрытие: 96 тиков = 96мкс
- * BREAK = 88 тиков, стоп-бит = 8 тиков
- * ====================================================================== */
-
-#define LUT_ENTRIES 97
-#define RMT_TICKS_PER_BIT 4
-
-static const uint8_t duration_to_bits_lut[LUT_ENTRIES] = {
-    [0]  = 0,  /* 0 тиков — шум */
-    [1]  = 0,  [2]  = 0,  [3]  = 0,  /* 1-3 — шум */
-    [4]  = 1,  /* 4 тика = 1 бит */
-    [5]  = 1,  [6]  = 1,  [7]  = 1,
-    [8]  = 2,  /* 8 тиков = 2 бита (стоп-бит) */
-    [9]  = 2,  [10] = 2,  [11] = 2,
-    [12] = 3,  /* 12 тиков = 3 бита */
-    [13] = 3,  [14] = 3,  [15] = 3,
-    [16] = 4,  [17] = 4,  [18] = 4,  [19] = 4,
-    [20] = 5,  [21] = 5,  [22] = 5,  [23] = 5,
-    [24] = 6,  [25] = 6,  [26] = 6,  [27] = 6,
-    [28] = 7,  [29] = 7,  [30] = 7,  [31] = 7,
-    [32] = 8,  [33] = 8,  [34] = 8,  [35] = 8,  /* 32-35 = 8 бит (данные) */
-    [36] = 9,  [37] = 9,  [38] = 9,  [39] = 9,  /* 36-39 = 9 бит (старт+8) */
-    [40] = 10, [41] = 10, [42] = 10, [43] = 10, /* 40-43 = 10 бит (старт+данные+стоп) */
-    [44] = 11, [45] = 11, [46] = 11, [47] = 11,
-    [48] = 12, [49] = 12, [50] = 12, [51] = 12,
-    [52] = 13, [53] = 13, [54] = 13, [55] = 13,
-    [56] = 14, [57] = 14, [58] = 14, [59] = 14,
-    [60] = 15, [61] = 15, [62] = 15, [63] = 15,
-    [64] = 16, [65] = 16, [66] = 16, [67] = 16,
-    [68] = 17, [69] = 17, [70] = 17, [71] = 17,
-    [72] = 18, [73] = 18, [74] = 18, [75] = 18,
-    [76] = 19, [77] = 19, [78] = 19, [79] = 19,
-    [80] = 20, [81] = 20, [82] = 20, [83] = 20,
-    [84] = 21, [85] = 21, [86] = 21, [87] = 21,
-    [88] = 22, /* 88 тиков = BREAK (22 бита) */
-    [89] = 22, [90] = 22, [91] = 22,
-    [92] = 23, [93] = 23, [94] = 23, [95] = 23,
-    [96] = 24,
-};
-
-/* Порог BREAK в тиках: 88мкс × 1 тик/мкс = 88 */
-#define BREAK_TICKS  88
 
 /* ======================================================================
  *  RMT RX РЕЖИМ (DMX_SW_UART_MODE == 1)
@@ -166,144 +119,214 @@ static bool IRAM_ATTR rmt_rx_done_cb(rmt_channel_handle_t channel,
     return wake == pdTRUE;
 }
 
-/*
- * LUT быстрый декод: duration_in_ticks → количество бит
- */
-static inline int IRAM_ATTR lut_decode_bits(uint32_t dur_ticks) {
-    if (dur_ticks >= LUT_ENTRIES) return 24;
-    return duration_to_bits_lut[dur_ticks];
+/* ======================================================================
+ * NIBBLE LUT: RMT импульсы → 4-битный ниббл (0x0..0xF)
+ * ======================================================================
+ *
+ * Каждый ниббл DMX = стартовый бит (LOW 4т) + 4 данных бита (LSB first).
+ * RMT items: level + duration в тиках (1MHz клок, 1 тик = 1мкс).
+ *
+ * Вход: массив {pulse_ticks, level} из 1-4 items
+ * Выход: 4 бита (0x0..0xF) или -1 если не матчит
+ * consumed: сколько items съедено
+ *
+ * Паттерны (старт=LOW всегда):
+ *   0x0: [12L]           0x8: [4L, 12H]
+ *   0x1: [8L, 4H]        0x9: [4L, 8H, 4L]
+ *   0x2: [8L, 4H, 4L]    0xA: [4L, 4H, 4L, 4H]
+ *   0x3: [8L, 8H]        0xB: [4L, 4H, 8L]
+ *   0x4: [4L, 4H, 8L]    0xC: [8L, 8H]
+ *   0x5: [4L, 4H, 4L, 4H] 0xD: [8L, 4H, 4L]
+ *   0x6: [4L, 8H, 4L]    0xE: [12L, 4H]
+ *   0x7: [4L, 12H]       0xF: [16H]
+ * ====================================================================== */
+
+#define NIBBLE_MATCH(val, target) ((val) >= ((target) - 1) && (val) <= ((target) + 1))
+
+typedef struct {
+    uint8_t pulses[4];
+    bool    levels[4];
+    uint8_t count;
+} nibble_item_t;
+
+static int8_t IRAM_ATTR decode_nibble_lut(const nibble_item_t *n, uint8_t *consumed) {
+    if (n->count == 0) return -1;
+
+    uint8_t p0 = n->pulses[0];
+    bool hi0 = n->levels[0];
+
+    if (!hi0) {
+        /* === Группа начинающаяся с LOW (0x0..0x7) === */
+        if (NIBBLE_MATCH(p0, 12) && n->count >= 1) {
+            /* Проверяем что ВЕСЬ ниббл в одном item (нет后续 HIGH) */
+            if (n->count == 1 || !n->levels[1]) {
+                *consumed = 1; return 0x0;
+            }
+        }
+        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]) {
+            if (n->count == 2 || !n->levels[2]) {
+                *consumed = 2; return 0x1;
+            }
+        }
+        if (NIBBLE_MATCH(p0, 8) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]) {
+            *consumed = 3; return 0x2;
+        }
+        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 8) && n->levels[1]) {
+            *consumed = 2; return 0x3;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 8) && !n->levels[2]) {
+            *consumed = 3; return 0x4;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 4 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]
+            && NIBBLE_MATCH(n->pulses[3], 4) && n->levels[3]) {
+            *consumed = 4; return 0x5;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 8) && n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]) {
+            *consumed = 3; return 0x6;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 12) && n->levels[1]) {
+            *consumed = 2; return 0x7;
+        }
+    } else {
+        /* === Группа начинающаяся с HIGH (0x8..0xF) === */
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 12) && !n->levels[1]) {
+            *consumed = 2; return 0x8;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 8) && !n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]) {
+            *consumed = 3; return 0x9;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 4 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]
+            && NIBBLE_MATCH(n->pulses[3], 4) && !n->levels[3]) {
+            *consumed = 4; return 0xA;
+        }
+        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 8) && n->levels[2]) {
+            *consumed = 3; return 0xB;
+        }
+        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 8) && !n->levels[1]) {
+            *consumed = 2; return 0xC;
+        }
+        if (NIBBLE_MATCH(p0, 8) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
+            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]) {
+            *consumed = 3; return 0xD;
+        }
+        if (NIBBLE_MATCH(p0, 12) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]) {
+            *consumed = 2; return 0xE;
+        }
+        if (NIBBLE_MATCH(p0, 16) && n->count >= 1) {
+            *consumed = 1; return 0xF;
+        }
+    }
+
+    return -1;
+}
+
+/* ======================================================================
+ * CARRY BUFFER + NIBBLE DECODE С PHASE TRACKING
+ * ======================================================================
+ *
+ * Phase:
+ *   0 = ожидаем ниббл (нижний или верхний — фаза неизвестна)
+ *   1 = ожидаем стартовый бит (LOW) — начало нибbla
+ *   2 = внутри нибbla — данные
+ *   3 = стоп-биты нибbla — ожидаем HIGH
+ *
+ * Carry: остаток items от предыдущего batch, не полностью обработанных
+ * ====================================================================== */
+
+/* Decode одного нибbla из потока RMT items с учётом carry */
+static int8_t IRAM_ATTR decode_nibble_from_stream(
+    const uint8_t *pulses, const bool *levels, uint8_t count,
+    uint8_t *consumed)
+{
+    nibble_item_t n;
+    n.count = (count > 4) ? 4 : count;
+    for (int i = 0; i < n.count; i++) {
+        n.pulses[i] = pulses[i];
+        n.levels[i] = levels[i];
+    }
+    return decode_nibble_lut(&n, consumed);
 }
 
 /*
- * Декод буфера RMT символов в DMX байты.
+ * Обработка потока RMT items с carry buffer и phase tracking.
  *
- * RMT symbol_word_t = 32 бита: [dur0:15|level0:1][dur1:15|level1:1]
- * Разбивается на 2 rmt_item16_t.
- *
- * DMX512 UART frame на один байт:
- *   [START=LOW 40тик][D0][D1]...[D7][STOP=HIGH 40тик][STOP=HIGH 40тик]
- *   LSB first: D0 — младший бит
- *
- * RMT RX на линии видит:
- *   BREAK: LOW > 880 тиков → начало нового кадра
- *   MAB:   HIGH ≥80 тиков
- *   START: LOW ~40 тиков
- *   Данные: чередование HIGH/LOW по 40 тиков (или кратные)
- *   STOP:  HIGH 80 тиков (2 стоп-бита)
- *
- * Декодер:
- *   - Накапливаем биты в текущем байте (bit_idx 0-9)
- *   - bit_idx=0: стартовый бит (LOW), проверяем
- *   - bit_idx=1..8: данные (LSB first)
- *   - bit_idx=9..10: стоп-биты (HIGH), проверяем
- *   - После bit_idx=10: байт готов → store, reset
- * ====================================================================== */
-
-static void IRAM_ATTR decode_rmt_buffer(const rmt_symbol_word_t *syms,
-                                         int num_symbols,
-                                         sw_uart_ctx_t *ctx)
+ * @param stream_idx   Индекс DMX порта (0 или 1)
+ * @param rmt_items    Массив {duration_ticks, level} из RMT callback
+ * @param rmt_count    Количество items
+ */
+static void decode_stream_with_carry(int stream_idx,
+                                     const uint8_t *rmt_pulses,
+                                     const bool *rmt_levels,
+                                     uint8_t rmt_count,
+                                     sw_uart_ctx_t *ctx)
 {
-    /* Используем state из контекста (меж-batch) */
-    uint32_t *accum = &ctx->byte_accum;
-    int *bidx = &ctx->bit_idx;
-    int *bcount = &ctx->byte_count;
+    /* Рабочий буфер: carry + новые items */
+    uint8_t work_pulses[8 + 64];
+    bool    work_levels[8 + 64];
+    uint8_t work_count = 0;
 
-    /* Разбиваем rmt_symbol_word_t на rmt_item16_t:
-     * item[2*i]   = { level0, duration0 }
-     * item[2*i+1] = { level1, duration1 } */
-    const uint16_t *raw = (const uint16_t *)syms;
-    int total_items = num_symbols * 2;
+    /* Шаг 1: carry из прошлого batch */
+    if (ctx->carry_count > 0) {
+        for (int i = 0; i < ctx->carry_count; i++) {
+            work_pulses[i] = ctx->carry_pulses[i];
+            work_levels[i] = ctx->carry_levels[i];
+        }
+        work_count = ctx->carry_count;
+        ctx->carry_count = 0;
+    }
 
-    for (int i = 0; i < total_items; i++) {
-        uint16_t val = raw[i];
-        int lvl = (val >> 15) & 1;          /* level: бит 15 */
-        uint32_t dur = (uint32_t)(val & 0x7FFF); /* duration: биты 0-14 */
+    /* Шаг 2: новые items */
+    for (int i = 0; i < rmt_count && work_count < sizeof(work_pulses); i++) {
+        work_pulses[work_count] = rmt_pulses[i];
+        work_levels[work_count] = rmt_levels[i];
+        work_count++;
+    }
 
-        if (dur == 0) continue;
+    /* Шаг 3: декод нибблов */
+    uint8_t idx = 0;
 
-        int bits = lut_decode_bits(dur);
+    while (idx < work_count) {
+        uint8_t consumed = 0;
+        int8_t nibble = decode_nibble_from_stream(
+            &work_pulses[idx], &work_levels[idx], work_count - idx, &consumed);
 
-        /* === BREAK DETECTION === */
-        if (lvl == 0 && bits >= 22) {
-            /* LOW > 880 тиков = BREAK → завершить предыдущий кадр */
-            if (*bcount > 0) {
-                ctx->rx_head = *bcount;
-                memcpy(ctx->rx_done, ctx->rx_active, ctx->rx_head);
-                ctx->last_frame_len = ctx->rx_head;
-                ctx->frame_count++;
-                ctx->frame_ready = true;
-                if (ctx->notify_task) {
-                    BaseType_t wake = pdFALSE;
-                    vTaskNotifyGiveFromISR(ctx->notify_task, &wake);
-                }
-            }
-            /* Сброс state */
-            *bcount = 0;
-            *bidx = 0;
-            *accum = 0;
-            memset(ctx->rx_active, 0, DMX_CHANNELS);
-            ctx->in_frame = true;
-            ctx->break_count++;
-            continue;
+        if (nibble < 0) {
+            /* LUT не матчит — сохраняем остаток в carry */
+            break;
         }
 
-        if (!ctx->in_frame) continue;
-
-        /* === DECODE BITS === */
-        for (int b = 0; b < bits; b++) {
-            if (*bidx == 0) {
-                /* ФАЗА СТАРТА: ожидаем LOW */
-                if (lvl != 0) {
-                    /* HIGH на старте — либо стоп-бит предыдущего байта (если bits>1),
-                     * либо ошибка. Если осталось >1 бит в item — это стоп-биты,
-                     * просто пропускаем. Если 1 бит — ошибка. */
-                    if (bits - b > 1) {
-                        /* Остальные биты в item — стоп-биты, пропускаем */
-                        break;
-                    }
-                    ctx->err_count++;
-                    ctx->in_frame = false;
-                    break;
-                }
-                *bidx = 1;
-                continue;
+        if (ctx->nibble_phase == 0) {
+            ctx->current_byte = nibble;
+            ctx->nibble_phase = 1;
+        } else {
+            ctx->current_byte |= (nibble << 4);
+            if (ctx->byte_count < DMX_CHANNELS) {
+                ctx->rx_active[ctx->byte_count] = ctx->current_byte;
+                ctx->byte_count++;
             }
-
-            if (*bidx >= 1 && *bidx <= 8) {
-                if (lvl) {
-                    *accum |= (1U << (*bidx - 1));
-                }
-                (*bidx)++;
-                continue;
-            }
-
-            if (*bidx >= 9) {
-                /* СТОП-БИТЫ (9, 10): должны быть HIGH */
-                if (lvl == 0) {
-                    ctx->err_count++;
-                }
-                (*bidx)++;
-
-                if (*bidx >= 11) {
-                    /* Байт готов → STORE */
-                    if (*bcount < DMX_CHANNELS) {
-                        ctx->rx_active[*bcount] = *accum & 0xFF;
-                        (*bcount)++;
-                    }
-                    *bidx = 0;
-                    *accum = 0;
-
-                    /* Остаток item'а после store:
-                     * Если level=HIGH и биты >0 — это стоп-биты следующего
-                     * байта или D0. Просто потребляем (break).
-                     * Следующий item начнёт новый байт. */
-                    if (lvl == 1 && (bits - b - 1) > 0) {
-                        break;
-                    }
-                }
-                continue;
-            }
+            ctx->current_byte = 0;
+            ctx->nibble_phase = 0;
         }
+
+        idx += consumed;
+    }
+
+    /* Шаг 4: остаток в carry */
+    uint8_t remaining = work_count - idx;
+    ctx->carry_count = 0;
+    if (remaining > 0 && remaining <= 8) {
+        for (int i = 0; i < remaining; i++) {
+            ctx->carry_pulses[i] = work_pulses[idx + i];
+            ctx->carry_levels[i] = work_levels[idx + i];
+        }
+        ctx->carry_count = remaining;
     }
 }
 
@@ -316,31 +339,72 @@ static void rmt_rx_task(void *arg)
     sw_uart_ctx_t *ctx = &s_ctx[port];
     rmt_rx_msg_t msg;
 
-    /* Буфер приёма RMT: 64 words = 256 байт, на стеке таска (4KB стек хватит) */
+    /* Буфер приёма RMT */
     rmt_symbol_word_t rx_buf[RMT_RX_BUF_SYMBOLS];
 
+    /* Буферы для извлечения items из RMT символов */
+    uint8_t item_pulses[128];
+    bool    item_levels[128];
+
     rmt_receive_config_t rx_cfg = {
-        .signal_range_min_ns = 1000,   /* Мин. 1мкс (фильтр glitches) */
+        .signal_range_min_ns = 1000,   /* Мин. 1мкс */
         .signal_range_max_ns = 100000, /* Макс. 100мкс — BREAK=88мкс */
     };
 
     ESP_LOGI(TAG, "RMT RX task started for port %d (GPIO%d)", port, ctx->gpio_rx);
 
     while (1) {
-        /* Запускаем приём в выделенный буфер */
         ESP_ERROR_CHECK(rmt_receive(ctx->rmt_rx_chan, rx_buf,
                                      sizeof(rx_buf), &rx_cfg));
 
-        /* Ждём данные из callback */
         while (xQueueReceive(ctx->rmt_rx_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            /* Декодируем RMT символы → DMX байты */
-            decode_rmt_buffer(msg.symbols, msg.num_symbols, ctx);
+            /* Извлекаем items: каждый rmt_symbol_word_t = 2 items */
+            const uint16_t *raw = (const uint16_t *)msg.symbols;
+            int total_items = msg.num_symbols * 2;
+            int item_count = 0;
 
-            /* is_last = таймаут (линия тихая) → кадр завершён */
-            if (msg.is_last && ctx->in_frame && ctx->rx_head > 0) {
-                /* Кадр завершён по таймауту RMT */
-                memcpy(ctx->rx_done, ctx->rx_active, ctx->rx_head);
-                ctx->last_frame_len = ctx->rx_head;
+            for (int i = 0; i < total_items && item_count < 128; i++) {
+                uint16_t val = raw[i];
+                int lvl = (val >> 15) & 1;
+                uint32_t dur = val & 0x7FFF;
+                if (dur == 0) continue;
+
+                /* BREAK detection: LOW > 88 тиков (88мкс при 1MHz) */
+                if (lvl == 0 && dur >= 88) {
+                    /* Завершить предыдущий кадр */
+                    if (ctx->byte_count > 0) {
+                        memcpy(ctx->rx_done, ctx->rx_active, ctx->byte_count);
+                        ctx->last_frame_len = ctx->byte_count;
+                        ctx->frame_count++;
+                        ctx->frame_ready = true;
+                        if (ctx->notify_task) {
+                            BaseType_t wake = pdFALSE;
+                            vTaskNotifyGiveFromISR(ctx->notify_task, &wake);
+                        }
+                    }
+                    ctx->byte_count = 0;
+                    ctx->nibble_phase = 0;
+                    ctx->current_byte = 0;
+                    ctx->carry_count = 0;
+                    ctx->in_frame = true;
+                    ctx->break_count++;
+                    item_count = 0;
+                    continue;
+                }
+
+                item_pulses[item_count] = (uint8_t)(dur > 255 ? 255 : dur);
+                item_levels[item_count] = (lvl != 0);
+                item_count++;
+            }
+
+            if (item_count > 0 && ctx->in_frame) {
+                decode_stream_with_carry(port, item_pulses, item_levels, item_count, ctx);
+            }
+
+            /* is_last = таймаут → кадр завершён */
+            if (msg.is_last && ctx->in_frame && ctx->byte_count > 0) {
+                memcpy(ctx->rx_done, ctx->rx_active, ctx->byte_count);
+                ctx->last_frame_len = ctx->byte_count;
                 ctx->frame_count++;
                 ctx->frame_ready = true;
                 ctx->in_frame = false;
@@ -351,7 +415,7 @@ static void rmt_rx_task(void *arg)
                 }
             }
 
-            /* Re-arm приёма (ESP32 без ping-pong) */
+            /* Re-arm */
             if (!msg.is_last) {
                 ESP_ERROR_CHECK(rmt_receive(ctx->rmt_rx_chan, rx_buf,
                                              sizeof(rx_buf), &rx_cfg));
@@ -484,9 +548,10 @@ void uart_bypass_init(int port) {
     ctx->rmt_rx_queue = NULL;
     ctx->rmt_rx_task = NULL;
     ctx->timeout_thresh = DMX_RMT_IDLE_US;
-    ctx->byte_accum = 0;
-    ctx->bit_idx = 0;
+    ctx->nibble_phase = 0;
+    ctx->current_byte = 0;
     ctx->byte_count = 0;
+    ctx->carry_count = 0;
 #endif
 }
 
