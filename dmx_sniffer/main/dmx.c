@@ -175,7 +175,10 @@ static volatile bool s_fallback_pending = false;
 static void led_refresh_task(void *arg) {
     while (1) {
         xSemaphoreTake(s_led_refresh_sem, pdMS_TO_TICKS(5));
-        if (s_fallback_pending) s_fallback_pending = false;
+        if (s_fallback_pending) {
+            s_fallback_pending = false;
+            dmx_apply_fallback();
+        }
         led_strip_refresh();
     }
 }
@@ -617,11 +620,16 @@ void dmx_apply_color_order(uint8_t ch_order, uint8_t *r, uint8_t *g, uint8_t *b)
 /**
  * @brief Callback таймера fallback (вызывается из esp_timer task)
  *
- * Записывает fallback-цвет в буфер и ставит флаг s_fallback_pending.
- * Задача led_ref обнаружит флаг и вызовет led_strip_refresh().
+ * НЕ вызывает dmx_apply_fallback() напрямую — это вызвало бы deadlock,
+ * потому что dmx_apply_fallback() берёт g_dmx_mutex с portMAX_DELAY,
+ * а esp_timer task не должен блокироваться на мьютексах.
+ *
+ * Вместо этого ставит флаг s_fallback_pending и сигналит led_refresh_task.
+ * Задача led_refresh_task применит fallback-цвет в контексте задачи (безопасно).
  */
 static void fallback_timer_callback(void *arg) {
-    dmx_apply_fallback();
+    s_fallback_pending = true;
+    xSemaphoreGive(s_led_refresh_sem);
 }
 
 /** Внешняя ссылка на флаг тестового режима (объявлен в web_server.c) */
