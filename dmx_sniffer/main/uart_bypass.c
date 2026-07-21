@@ -776,10 +776,17 @@ void uart_bypass_start_timer(void) {
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, DMX_GPIO_TX1, DMX_GPIO_RX1,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
+#if DMX_RX_ROUTING_MATRIX
+    /* Routing matrix: оба UART RX на одном пине (GPIO15) */
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX1,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+#else
     /* UART2: TX=GPIO17, RX=GPIO16 */
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX2,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+#endif
 
     /* RX FIFO threshold: прерывание при 32 байтах — быстрое чтение,
      * данные не застряют в FIFO к моменту BREAK */
