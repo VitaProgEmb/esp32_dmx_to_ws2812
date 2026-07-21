@@ -446,6 +446,11 @@ static void dmx_stream_rx_task(void *arg) {
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint8_t buf[BYPASS_DMX_SIZE];
+        uint32_t frame_len = 0;
+        if (uart_bypass_get_frame(port, buf, sizeof(buf), &frame_len) && frame_len > 0) {
+            dmx_process_frame(port, buf + 1, frame_len - 1);
+        }
         dmx_process_leds(port);
     }
 }

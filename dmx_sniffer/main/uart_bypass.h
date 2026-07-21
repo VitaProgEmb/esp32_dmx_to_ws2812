@@ -17,3 +17,11 @@ bool uart_bypass_get_frame(int port, uint8_t *out, int max_len, uint32_t *frame_
 uint32_t uart_bypass_get_isr_count(int port);
 uint32_t uart_bypass_get_break_count(int port);
 uint32_t uart_bypass_get_ovf_count(int port);
+uint32_t uart_bypass_get_last_sym0(int port);
+uint32_t uart_bypass_get_last_sym1(int port);
+uint32_t uart_bypass_get_last_num_symbols(int port);
+uint32_t uart_bypass_get_last_is_last(int port);
+uint32_t uart_bypass_get_last_symN_m1(int port);
+uint32_t uart_bypass_get_last_symN(int port);
+uint32_t uart_bypass_get_break_search_found(int port);
+uint32_t uart_bypass_get_break_search_idx(int port);

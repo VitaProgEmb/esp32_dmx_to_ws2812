@@ -1,14 +1,17 @@
 #include "uart_bypass.h"
 #include "settings.h"
 #include "esp_attr.h"
+#include "esp_intr_alloc.h"
 #include "driver/gpio.h"
-#include "driver/uart.h"
 #include "driver/rmt_rx.h"
+#include "hal/uart_ll.h"
+#include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "dmx_hal.h"
 #include "dmx.h"
 #include <string.h>
@@ -37,6 +40,15 @@ typedef struct {
     volatile uint32_t break_count;
     volatile uint32_t err_count;
     volatile uint32_t isr_count;
+    /* Symbol diagnostics (from last callback) */
+    volatile uint32_t last_num_symbols;
+    volatile uint32_t last_is_last;
+    volatile uint32_t last_sym0;     /* first symbol raw */
+    volatile uint32_t last_sym1;     /* second symbol raw */
+    volatile uint32_t last_symN_m1;  /* second-to-last symbol raw */
+    volatile uint32_t last_symN;     /* last symbol raw */
+    volatile uint32_t break_search_found;  /* 1 if BREAK found in this batch */
+    volatile uint32_t break_search_idx;    /* item index where BREAK was found */
 
     /* Task notification */
     TaskHandle_t notify_task;
@@ -53,14 +65,10 @@ typedef struct {
     TaskHandle_t rmt_rx_task;
     volatile bool in_frame;
     uint32_t timeout_thresh;
-    /* Decoder state (меж-batch) */
-    uint8_t nibble_phase;        /* 0=low nibble, 1=high nibble */
-    uint8_t current_byte;        /* собранный байт */
+    /* Bit-level decoder state (меж-batch) */
+    uint8_t bit_pos;            /* 0=waiting start, 1-8=data, 9-10=stop */
+    uint16_t byte_val;          /* accumulated byte value */
     int byte_count;
-    /* Carry buffer — остаток items между batch'ами */
-    uint8_t carry_pulses[8];
-    bool    carry_levels[8];
-    uint8_t carry_count;
 #endif
 
 #if DMX_SW_UART_MODE == 0
@@ -73,6 +81,13 @@ typedef struct {
     bool seen_break;
     portMUX_TYPE mux;
 #endif
+
+#if DMX_SW_UART_MODE == 2
+    /* HW UART RX specific */
+    bool in_frame;
+    int64_t last_break_us;
+    intr_handle_t intr_handle;
+#endif
 } sw_uart_ctx_t;
 
 static sw_uart_ctx_t s_ctx[2];
@@ -83,7 +98,10 @@ static sw_uart_ctx_t s_ctx[2];
 
 #if DMX_SW_UART_MODE == 1
 
-/* Буфер RMT RX: 64 rmt_symbol_word_t = 128 rmt_item16_t */
+/* Буфер RMT RX: 64 rmt_symbol_word_t = 128 rmt_item16_t.
+ * 513 байт DMX декодируется через МНОГОКАЗОВЫЙ callback.
+ * Каждый callback = 64 symbols ≈ 20-30 байт, цикл продолжается до is_last (idle).
+ * Итого ~25 callback на кадр, byte_count накапливается. */
 #define RMT_RX_BUF_SYMBOLS  64
 /* Максимальное количество rmt_item16_t в одном блоке */
 #define RMT_RX_BUF_ITEMS   (RMT_RX_BUF_SYMBOLS * 2)
@@ -116,222 +134,98 @@ static bool IRAM_ATTR rmt_rx_done_cb(rmt_channel_handle_t channel,
     BaseType_t wake = pdFALSE;
     xQueueSendFromISR(ctx->rmt_rx_queue, &msg, &wake);
     ctx->isr_count++;
+    ctx->last_num_symbols = edata->num_symbols;
+    ctx->last_is_last = edata->flags.is_last;
+    ctx->last_sym0 = edata->num_symbols > 0 ? ((uint32_t *)edata->received_symbols)[0] : 0;
+    ctx->last_sym1 = edata->num_symbols > 1 ? ((uint32_t *)edata->received_symbols)[1] : 0;
+    ctx->last_symN_m1 = edata->num_symbols > 1 ? ((uint32_t *)edata->received_symbols)[edata->num_symbols - 1] : 0;
+    ctx->last_symN = edata->num_symbols > 0 ? ((uint32_t *)edata->received_symbols)[edata->num_symbols - 1] : 0;
     return wake == pdTRUE;
 }
 
 /* ======================================================================
- * NIBBLE LUT: RMT импульсы → 4-битный ниббл (0x0..0xF)
+ * БИТОВЫЙ ДЕКОДЕР: RMT items → DMX bytes (4мкс/бит)
  * ======================================================================
  *
- * Каждый ниббл DMX = стартовый бит (LOW 4т) + 4 данных бита (LSB first).
- * RMT items: level + duration в тиках (1MHz клок, 1 тик = 1мкс).
+ * DMX512 = 250kbaud = 4мкс/бит. Каждый байт:
+ *   1 стартовый бит (LOW, 4мкс)
+ *   8 бит данных (LSB first, каждый 4мкс)
+ *   2 стоп-бита (HIGH, 8мкс всего)
  *
- * Вход: массив {pulse_ticks, level} из 1-4 items
- * Выход: 4 бита (0x0..0xF) или -1 если не матчит
- * consumed: сколько items съедено
+ * RMT items: [level, duration_ticks] при 1MHz = 1 тик = 1мкс.
+ * RMT ОБЪЕДИНЯЕТ подряд идущие одинаковые уровни:
+ *   0x00 → [LOW, 36] [HIGH, 8]   (старт+8×0=36мкс LOW)
+ *   0xFF → [LOW, 4] [HIGH, 40]   (старт=4мкс LOW, 8×1+стоп=40мкс HIGH)
+ *   0x55 → [LOW,4][HIGH,4][LOW,4]...[HIGH,8]
  *
- * Паттерны (старт=LOW всегда):
- *   0x0: [12L]           0x8: [4L, 12H]
- *   0x1: [8L, 4H]        0x9: [4L, 8H, 4L]
- *   0x2: [8L, 4H, 4L]    0xA: [4L, 4H, 4L, 4H]
- *   0x3: [8L, 8H]        0xB: [4L, 4H, 8L]
- *   0x4: [4L, 4H, 8L]    0xC: [8L, 8H]
- *   0x5: [4L, 4H, 4L, 4H] 0xD: [8L, 4H, 4L]
- *   0x6: [4L, 8H, 4L]    0xE: [12L, 4H]
- *   0x7: [4L, 12H]       0xF: [16H]
+ * Алгоритм: для каждого item делим duration на 4мкс → количество бит.
+ * Бит 0 = старт (LOW), биты 1-8 = данные, биты 9-10 = стоп (HIGH).
  * ====================================================================== */
-
-#define NIBBLE_MATCH(val, target) ((val) >= ((target) - 1) && (val) <= ((target) + 1))
-
-typedef struct {
-    uint8_t pulses[4];
-    bool    levels[4];
-    uint8_t count;
-} nibble_item_t;
-
-static int8_t IRAM_ATTR decode_nibble_lut(const nibble_item_t *n, uint8_t *consumed) {
-    if (n->count == 0) return -1;
-
-    uint8_t p0 = n->pulses[0];
-    bool hi0 = n->levels[0];
-
-    if (!hi0) {
-        /* === Группа начинающаяся с LOW (0x0..0x7) === */
-        if (NIBBLE_MATCH(p0, 12) && n->count >= 1) {
-            /* Проверяем что ВЕСЬ ниббл в одном item (нет后续 HIGH) */
-            if (n->count == 1 || !n->levels[1]) {
-                *consumed = 1; return 0x0;
-            }
-        }
-        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]) {
-            if (n->count == 2 || !n->levels[2]) {
-                *consumed = 2; return 0x1;
-            }
-        }
-        if (NIBBLE_MATCH(p0, 8) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]) {
-            *consumed = 3; return 0x2;
-        }
-        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 8) && n->levels[1]) {
-            *consumed = 2; return 0x3;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 8) && !n->levels[2]) {
-            *consumed = 3; return 0x4;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 4 && NIBBLE_MATCH(n->pulses[1], 4) && n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]
-            && NIBBLE_MATCH(n->pulses[3], 4) && n->levels[3]) {
-            *consumed = 4; return 0x5;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 8) && n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && !n->levels[2]) {
-            *consumed = 3; return 0x6;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 12) && n->levels[1]) {
-            *consumed = 2; return 0x7;
-        }
-    } else {
-        /* === Группа начинающаяся с HIGH (0x8..0xF) === */
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 12) && !n->levels[1]) {
-            *consumed = 2; return 0x8;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 8) && !n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]) {
-            *consumed = 3; return 0x9;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 4 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]
-            && NIBBLE_MATCH(n->pulses[3], 4) && !n->levels[3]) {
-            *consumed = 4; return 0xA;
-        }
-        if (NIBBLE_MATCH(p0, 4) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 8) && n->levels[2]) {
-            *consumed = 3; return 0xB;
-        }
-        if (NIBBLE_MATCH(p0, 8) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 8) && !n->levels[1]) {
-            *consumed = 2; return 0xC;
-        }
-        if (NIBBLE_MATCH(p0, 8) && n->count >= 3 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]
-            && NIBBLE_MATCH(n->pulses[2], 4) && n->levels[2]) {
-            *consumed = 3; return 0xD;
-        }
-        if (NIBBLE_MATCH(p0, 12) && n->count >= 2 && NIBBLE_MATCH(n->pulses[1], 4) && !n->levels[1]) {
-            *consumed = 2; return 0xE;
-        }
-        if (NIBBLE_MATCH(p0, 16) && n->count >= 1) {
-            *consumed = 1; return 0xF;
-        }
-    }
-
-    return -1;
-}
-
-/* ======================================================================
- * CARRY BUFFER + NIBBLE DECODE С PHASE TRACKING
- * ======================================================================
- *
- * Phase:
- *   0 = ожидаем ниббл (нижний или верхний — фаза неизвестна)
- *   1 = ожидаем стартовый бит (LOW) — начало нибbla
- *   2 = внутри нибbla — данные
- *   3 = стоп-биты нибbla — ожидаем HIGH
- *
- * Carry: остаток items от предыдущего batch, не полностью обработанных
- * ====================================================================== */
-
-/* Decode одного нибbla из потока RMT items с учётом carry */
-static int8_t IRAM_ATTR decode_nibble_from_stream(
-    const uint8_t *pulses, const bool *levels, uint8_t count,
-    uint8_t *consumed)
-{
-    nibble_item_t n;
-    n.count = (count > 4) ? 4 : count;
-    for (int i = 0; i < n.count; i++) {
-        n.pulses[i] = pulses[i];
-        n.levels[i] = levels[i];
-    }
-    return decode_nibble_lut(&n, consumed);
-}
 
 /*
- * Обработка потока RMT items с carry buffer и phase tracking.
+ * Декодирование байтов из потока RMT items.
+ * Заменяет nibble-декодер — работает напрямую с битами (4мкс/бит).
  *
- * @param stream_idx   Индекс DMX порта (0 или 1)
- * @param rmt_items    Массив {duration_ticks, level} из RMT callback
+ * @param stream_idx   Индекс DMX порта (для логирования)
+ * @param rmt_pulses   Массив длительностей (в тиках)
+ * @param rmt_levels   Массив уровней (true=HIGH)
  * @param rmt_count    Количество items
+ * @param ctx          Контекст декодера
  */
-static void decode_stream_with_carry(int stream_idx,
-                                     const uint8_t *rmt_pulses,
-                                     const bool *rmt_levels,
-                                     uint8_t rmt_count,
-                                     sw_uart_ctx_t *ctx)
+static void decode_bytes_from_items(int stream_idx,
+                                    const uint8_t *rmt_pulses,
+                                    const bool *rmt_levels,
+                                    uint8_t rmt_count,
+                                    sw_uart_ctx_t *ctx)
 {
-    /* Рабочий буфер: carry + новые items */
-    uint8_t work_pulses[8 + 64];
-    bool    work_levels[8 + 64];
-    uint8_t work_count = 0;
+    for (int i = 0; i < rmt_count; i++) {
+        uint8_t dur = rmt_pulses[i];
+        bool level = rmt_levels[i];
 
-    /* Шаг 1: carry из прошлого batch */
-    if (ctx->carry_count > 0) {
-        for (int i = 0; i < ctx->carry_count; i++) {
-            work_pulses[i] = ctx->carry_pulses[i];
-            work_levels[i] = ctx->carry_levels[i];
-        }
-        work_count = ctx->carry_count;
-        ctx->carry_count = 0;
-    }
+        /* Количество бит в этом item: duration / 4мкс */
+        uint8_t num_bits = dur / BIT_PERIOD_US;
+        if (num_bits == 0) num_bits = 1;
 
-    /* Шаг 2: новые items */
-    for (int i = 0; i < rmt_count && work_count < sizeof(work_pulses); i++) {
-        work_pulses[work_count] = rmt_pulses[i];
-        work_levels[work_count] = rmt_levels[i];
-        work_count++;
-    }
-
-    /* Шаг 3: декод нибблов */
-    uint8_t idx = 0;
-
-    while (idx < work_count) {
-        uint8_t consumed = 0;
-        int8_t nibble = decode_nibble_from_stream(
-            &work_pulses[idx], &work_levels[idx], work_count - idx, &consumed);
-
-        if (nibble < 0) {
-            /* LUT не матчит — сохраняем остаток в carry */
-            break;
-        }
-
-        if (ctx->nibble_phase == 0) {
-            ctx->current_byte = nibble;
-            ctx->nibble_phase = 1;
-        } else {
-            ctx->current_byte |= (nibble << 4);
-            if (ctx->byte_count < DMX_CHANNELS) {
-                ctx->rx_active[ctx->byte_count] = ctx->current_byte;
-                ctx->byte_count++;
+        for (uint8_t b = 0; b < num_bits; b++) {
+            if (ctx->bit_pos == 0) {
+                /* Ожидаем стартовый бит (LOW) */
+                if (!level) {
+                    ctx->bit_pos = 1;
+                    ctx->byte_val = 0;
+                }
+                /* HIGH — межбайтовая пауза, пропускаем */
+            } else if (ctx->bit_pos <= 8) {
+                /* Бит данных (LSB first) */
+                if (level) {
+                    ctx->byte_val |= (1 << (ctx->bit_pos - 1));
+                }
+                ctx->bit_pos++;
+            } else {
+                /* Стоп-биты (биты 9, 10) — ожидаем HIGH */
+                ctx->bit_pos++;
+                if (ctx->bit_pos >= 11) {
+                    /* Байт готов */
+                    if (ctx->byte_count < DMX_CHANNELS) {
+                        ctx->rx_active[ctx->byte_count] = ctx->byte_val;
+                        ctx->byte_count++;
+                    }
+                    ctx->bit_pos = 0;
+                    ctx->byte_val = 0;
+                }
             }
-            ctx->current_byte = 0;
-            ctx->nibble_phase = 0;
         }
-
-        idx += consumed;
-    }
-
-    /* Шаг 4: остаток в carry */
-    uint8_t remaining = work_count - idx;
-    ctx->carry_count = 0;
-    if (remaining > 0 && remaining <= 8) {
-        for (int i = 0; i < remaining; i++) {
-            ctx->carry_pulses[i] = work_pulses[idx + i];
-            ctx->carry_levels[i] = work_levels[idx + i];
-        }
-        ctx->carry_count = remaining;
     }
 }
 
 /*
  * Task приёма RMT RX — обрабатывает символы из очереди.
+ *
+ * КРИТИЧЕСКИ ВАЖНО для ESP32:
+ *   rmt_disable()/rmt_enable() НЕ останавливают движок (нет async stop).
+ *   После re-arm движок может выдать мусорный callback с предыдущего захвата.
+ *   Решение: пропускать сообщения с num_symbols==0 или dur==0 (мусор).
+ *   Также: signal_range_max_ns > BREAK (>88мкс) чтобы idle не срабатывал
+ *   во время данных, а только в паузах между кадрами.
  */
 static void rmt_rx_task(void *arg)
 {
@@ -339,29 +233,102 @@ static void rmt_rx_task(void *arg)
     sw_uart_ctx_t *ctx = &s_ctx[port];
     rmt_rx_msg_t msg;
 
-    /* Буфер приёма RMT */
+    /* Буферы на стеке — каждая задача (port0/port1) свои */
     rmt_symbol_word_t rx_buf[RMT_RX_BUF_SYMBOLS];
-
-    /* Буферы для извлечения items из RMT символов */
     uint8_t item_pulses[128];
     bool    item_levels[128];
 
+    /*
+     * signal_range_max_ns: при 1MHz → 1 тик = 1мкс.
+     * DMX кадр: BREAK(120мкс) + MAB(8мкс) + данные(~22мс) + MTBP(≥8мкс).
+     * Между кадрами пауза ≥ 8мкс (MTBP).
+     * Ставим 3000мкс (3мс) — idle сработает только в паузах между кадрами,
+     * НЕ во время BREAK и НЕ во время данных.
+     * При этом движок сам остановится через 3мс тишины на линии.
+     */
     rmt_receive_config_t rx_cfg = {
-        .signal_range_min_ns = 1000,   /* Мин. 1мкс */
-        .signal_range_max_ns = 100000, /* Макс. 100мкс — BREAK=88мкс */
+        .signal_range_min_ns = 1000,        /* 1мкс — глитч-фильтр */
+        .signal_range_max_ns = 3000000,     /* 3мс — idle только в паузах */
     };
 
     ESP_LOGI(TAG, "RMT RX task started for port %d (GPIO%d)", port, ctx->gpio_rx);
 
     while (1) {
-        ESP_ERROR_CHECK(rmt_receive(ctx->rmt_rx_chan, rx_buf,
-                                     sizeof(rx_buf), &rx_cfg));
+        /* === RE-ARM CYCLE ===
+         * На ESP32 rmt_disable() не останавливает движок (нет async stop).
+         * Движок продолжает работать и может выдать callback с мусором.
+         * Стратегия:
+         * 1. rmt_disable() — запрещаем новые захваты
+         * 2. Ждём 2мс — даём движку завершить текущий захват
+         * 3. Очищаем очередь от мусорных сообщений
+         * 4. rmt_enable() + rmt_receive() — начинаем новый захват
+         */
+        rmt_disable(ctx->rmt_rx_chan);
+        vTaskDelay(pdMS_TO_TICKS(2));
 
+        /* Очистить очередь от мусорных callback после disable */
+        { rmt_rx_msg_t stale;
+          while (xQueueReceive(ctx->rmt_rx_queue, &stale, 0) == pdTRUE) {
+              ctx->err_count++;
+          }
+        }
+
+        rmt_enable(ctx->rmt_rx_chan);
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        esp_err_t err = rmt_receive(ctx->rmt_rx_chan, rx_buf,
+                                     sizeof(rx_buf), &rx_cfg);
+        if (err != ESP_OK) {
+            ctx->err_count++;
+            ESP_LOGW(TAG, "rmt_receive err: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* Ждём реальный callback с данными */
         while (xQueueReceive(ctx->rmt_rx_queue, &msg, portMAX_DELAY) == pdTRUE) {
+
+            /* === ФИЛЬТРАЦИЯ МУСОРА ===
+             * После re-arm на ESP32 движок может выдать callback с:
+             *   num_symbols==0 — пустой захват
+             *   Все символы с dur==0 — мусор от предыдущего захвата
+             * Пропускаем такие сообщения.
+             */
+            bool is_garbage = (msg.num_symbols == 0);
+            if (!is_garbage && msg.num_symbols > 0) {
+                const uint16_t *raw_check = (const uint16_t *)msg.symbols;
+                bool all_zero = true;
+                for (int i = 0; i < msg.num_symbols * 2; i++) {
+                    if ((raw_check[i] & 0x7FFF) != 0) {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                is_garbage = all_zero;
+            }
+            if (is_garbage) {
+                /* Мусор от re-arm — пропускаем */
+                continue;
+            }
+
             /* Извлекаем items: каждый rmt_symbol_word_t = 2 items */
             const uint16_t *raw = (const uint16_t *)msg.symbols;
             int total_items = msg.num_symbols * 2;
             int item_count = 0;
+
+            /* Scan ALL items for BREAK first */
+            int break_item_idx = -1;
+            for (int i = 0; i < total_items; i++) {
+                uint16_t val = raw[i];
+                int lvl = (val >> 15) & 1;
+                uint32_t dur = val & 0x7FFF;
+                if (lvl == 0 && dur >= 88) {
+                    break_item_idx = i;
+                    break;
+                }
+            }
+            ctx->break_search_found = (break_item_idx >= 0) ? 1 : 0;
+            ctx->break_search_idx = (break_item_idx >= 0) ? break_item_idx : total_items;
 
             for (int i = 0; i < total_items && item_count < 128; i++) {
                 uint16_t val = raw[i];
@@ -383,9 +350,8 @@ static void rmt_rx_task(void *arg)
                         }
                     }
                     ctx->byte_count = 0;
-                    ctx->nibble_phase = 0;
-                    ctx->current_byte = 0;
-                    ctx->carry_count = 0;
+                    ctx->bit_pos = 0;
+                    ctx->byte_val = 0;
                     ctx->in_frame = true;
                     ctx->break_count++;
                     item_count = 0;
@@ -398,7 +364,7 @@ static void rmt_rx_task(void *arg)
             }
 
             if (item_count > 0 && ctx->in_frame) {
-                decode_stream_with_carry(port, item_pulses, item_levels, item_count, ctx);
+                decode_bytes_from_items(port, item_pulses, item_levels, item_count, ctx);
             }
 
             /* is_last = таймаут → кадр завершён */
@@ -415,11 +381,18 @@ static void rmt_rx_task(void *arg)
                 }
             }
 
-            /* Re-arm */
-            if (!msg.is_last) {
-                ESP_ERROR_CHECK(rmt_receive(ctx->rmt_rx_chan, rx_buf,
-                                             sizeof(rx_buf), &rx_cfg));
+            if (msg.is_last) {
+                /* Idle timeout → break for full re-arm cycle */
+                break;
             }
+            /* Buffer-full: on ESP32 original no en_partial_rx support.
+             * Must re-arm with full disable/enable cycle to continue. */
+            rmt_disable(ctx->rmt_rx_chan);
+            esp_err_t re = rmt_enable(ctx->rmt_rx_chan);
+            if (re != ESP_OK) { ctx->err_count++; break; }
+            re = rmt_receive(ctx->rmt_rx_chan, rx_buf,
+                             sizeof(rx_buf), &rx_cfg);
+            if (re != ESP_OK) { ctx->err_count++; break; }
         }
     }
 }
@@ -509,6 +482,129 @@ process_bits:
 #endif /* DMX_SW_UART_MODE == 0 */
 
 /* ======================================================================
+ *  HW UART RX РЕЖИМ (DMX_SW_UART_MODE == 2)
+ * ======================================================================
+ *
+ *  Прямой доступ к UART регистрам через uart_ll.h.
+ *  Свой ISR (esp_intr_alloc) вместо ESP-IDF UART driver ISR.
+ *  Глобальный spinlock защищает FIFO от одновременного доступа
+ *  с двух ядер (решает APB bus hang [CPU-3.21]).
+ *
+ *  Преимущества:
+ *    - Аппаратный UART декодирует 250kbaud 8N2 без CPU
+ *    - BREAK detection через аппаратное прерывание UART_BRK_DET
+ *    - FIFO 128 байт, threshold 112 → прерывание каждые ~4.5мс
+ *    - 0 CPU для захвата бит, только чтение FIFO в ISR (~1мкс)
+ * ====================================================================== */
+
+#if DMX_SW_UART_MODE == 2
+
+/* Глобальный spinlock — ОДИН на оба UART.
+ * portENTER_CRITICAL_ISR блокирует прерывания на текущем ядре
+ * и крутится если другое ядро держит этот же spinlock. */
+static portMUX_TYPE s_global_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#define UART_HW_RX_ISR_FLAGS  (UART_BRK_DET_INT_ENA | UART_FRM_ERR_INT_ENA | \
+                                UART_RXFIFO_FULL_INT_ENA | UART_RXFIFO_OVF_INT_ENA)
+
+/*
+ * ISR handler — вызывается из аппаратного прерывания UART.
+ * Читает FIFO под глобальным spinlock → нет APB bus hang.
+ */
+static void IRAM_ATTR uart_rx_isr(void *arg) {
+    int port = (int)arg;
+    sw_uart_ctx_t *ctx = &s_ctx[port];
+    uart_dev_t *hw = UART_LL_GET_HW(port);
+
+    uint32_t int_st;
+    while ((int_st = hw->int_st.val) != 0) {
+
+        /* === RXFIFO_FULL: данные в FIFO === */
+        if (int_st & UART_RXFIFO_FULL_INT_ST) {
+            hw->int_clr.val = UART_RXFIFO_FULL_INT_CLR;
+            ctx->isr_count++;
+
+            portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+            uint32_t fifo_len = uart_ll_get_rxfifo_len(hw);
+            if (fifo_len > 0 && ctx->in_frame &&
+                ctx->rx_head + fifo_len <= DMX_CHANNELS + 1) {
+                uart_ll_read_rxfifo(hw, ctx->rx_active + ctx->rx_head, fifo_len);
+                ctx->rx_head += fifo_len;
+            } else if (fifo_len > 0) {
+                /* Не в кадре или overflow — дропаем */
+                while (uart_ll_get_rxfifo_len(hw)) {
+                    (void)hw->fifo.val;
+                }
+                if (ctx->in_frame) ctx->err_count++;
+            }
+            portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
+        }
+
+        /* === BREAK_DET: обнаружен BREAK (≥88мкс LOW) === */
+        if (int_st & UART_BRK_DET_INT_ST) {
+            hw->int_clr.val = UART_BRK_DET_INT_CLR;
+            ctx->break_count++;
+
+            int64_t now = esp_timer_get_time();
+
+            /* Debounce: BREAK не может приходить чаще чем раз в 1мс */
+            if (now - ctx->last_break_us < 1000) {
+                portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+                while (uart_ll_get_rxfifo_len(hw)) {
+                    (void)hw->fifo.val;
+                }
+                portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
+                continue;
+            }
+            ctx->last_break_us = now;
+
+            /* Сохранить предыдущий кадр */
+            if (ctx->in_frame && ctx->rx_head > 0) {
+                memcpy(ctx->rx_done, ctx->rx_active, ctx->rx_head);
+                ctx->last_frame_len = ctx->rx_head;
+                ctx->frame_count++;
+                ctx->frame_ready = true;
+
+                if (ctx->notify_task) {
+                    BaseType_t wake = pdFALSE;
+                    vTaskNotifyGiveFromISR(ctx->notify_task, &wake);
+                }
+            }
+
+            /* Сброс для нового кадра */
+            ctx->rx_head = 0;
+            ctx->in_frame = true;
+
+            /* Дропаем мусор из FIFO (BREAK может вызвать FRM_ERR + мусорные байты) */
+            portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+            while (uart_ll_get_rxfifo_len(hw)) {
+                (void)hw->fifo.val;
+            }
+            portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
+        }
+
+        /* === FRM_ERR: ошибка кадра (нормально во время BREAK) === */
+        if (int_st & UART_FRM_ERR_INT_ST) {
+            hw->int_clr.val = UART_FRM_ERR_INT_CLR;
+        }
+
+        /* === RXFIFO_OVF: переполнение FIFO === */
+        if (int_st & UART_RXFIFO_OVF_INT_ST) {
+            hw->int_clr.val = UART_RXFIFO_OVF_INT_CLR;
+            ctx->err_count++;
+
+            portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+            while (uart_ll_get_rxfifo_len(hw)) {
+                (void)hw->fifo.val;
+            }
+            portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
+        }
+    }
+}
+
+#endif /* DMX_SW_UART_MODE == 2 */
+
+/* ======================================================================
  *  ОБЩИЙ API: init / start / get_frame / set_tx_mode
  * ====================================================================== */
 
@@ -528,7 +624,11 @@ void uart_bypass_init(int port) {
         ctx->gpio_rx = DMX_GPIO_RX1;
         ctx->uart_tx = UART_NUM_1;
     } else {
+#if DMX_RX_ROUTING_MATRIX
+        ctx->gpio_rx = DMX_GPIO_RX1;  /* матрица: оба порта на одном пине */
+#else
         ctx->gpio_rx = DMX_GPIO_RX2;
+#endif
         ctx->uart_tx = UART_NUM_2;
     }
 
@@ -548,10 +648,15 @@ void uart_bypass_init(int port) {
     ctx->rmt_rx_queue = NULL;
     ctx->rmt_rx_task = NULL;
     ctx->timeout_thresh = DMX_RMT_IDLE_US;
-    ctx->nibble_phase = 0;
-    ctx->current_byte = 0;
+    ctx->bit_pos = 0;
+    ctx->byte_val = 0;
     ctx->byte_count = 0;
-    ctx->carry_count = 0;
+#endif
+
+#if DMX_SW_UART_MODE == 2
+    ctx->in_frame = false;
+    ctx->last_break_us = 0;
+    ctx->intr_handle = NULL;
 #endif
 }
 
@@ -578,19 +683,24 @@ void uart_bypass_init_all(void) {
 #endif
 
 #if DMX_SW_UART_MODE == 1
-    /* RMT RX для каждого порта */
-    for (int port = 0; port < 2; port++) {
+    /* RMT RX для портов */
+    int rx_port_count = DMX_RX_ROUTING_MATRIX ? 1 : 2;
+    for (int port = 0; port < rx_port_count; port++) {
         sw_uart_ctx_t *ctx = &s_ctx[port];
 
         /* Очередь RMT callback → task */
         ctx->rmt_rx_queue = xQueueCreate(8, sizeof(rmt_rx_msg_t));
         assert(ctx->rmt_rx_queue);
 
-        /* RMT RX channel */
+        /* RMT RX channel — matrix: весь pool одному RX (512-LED64=448)
+         * normal: каждый RX по 64 (LED64+RX64+RX64=192 из 512) */
+        int buf_sym = DMX_RX_ROUTING_MATRIX
+                    ? (512 - 64)   /* весь pool минус LED */
+                    : RMT_RX_BUF_SYMBOLS;
         rmt_rx_channel_config_t rx_cfg = {
             .clk_src = RMT_CLK_SRC_DEFAULT,
             .resolution_hz = DMX_RMT_CLK_HZ,
-            .mem_block_symbols = RMT_RX_BUF_SYMBOLS,
+            .mem_block_symbols = buf_sym,
             .gpio_num = ctx->gpio_rx,
             .flags.invert_in = false,
             .flags.with_dma = false,
@@ -611,6 +721,11 @@ void uart_bypass_init_all(void) {
         ESP_LOGI(TAG, "RMT RX port%d on GPIO%d (ch%d)",
                  port, ctx->gpio_rx,
                  port == 0 ? DMX_RMT_RX_CH_PORT0 : DMX_RMT_RX_CH_PORT1);
+#if DMX_RX_ROUTING_MATRIX
+        if (port == 1) {
+            ESP_LOGI(TAG, "  [MATRIX] port1 routed to GPIO%d (same as port0)", DMX_GPIO_RX1);
+        }
+#endif
     }
 #endif
 
@@ -627,6 +742,8 @@ void uart_bypass_init_all(void) {
 }
 
 void uart_bypass_start_timer(void) {
+    ESP_LOGI(TAG, "Free heap before UART init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
     uart_config_t cfg = {
         .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -636,20 +753,65 @@ void uart_bypass_start_timer(void) {
         .source_clk = UART_SCLK_DEFAULT,
     };
 
+#if DMX_SW_UART_MODE == 2
+    /* =================================================================
+     * Mode 2: HW UART RX — полный bypass ESP-IDF UART driver.
+     * uart_param_config настраивает регистры (без ISR).
+     * uart_set_pin подключает GPIO к UART (без ISR).
+     * esp_intr_alloc ставит НАШ ISR вместо ISR драйвера.
+     * uart_driver_install НЕ вызывается!
+     * ================================================================= */
+
+    /* UART1: TX=GPIO2, RX=GPIO15 */
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, DMX_GPIO_TX1, DMX_GPIO_RX1,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    /* UART2: TX=GPIO17, RX=GPIO16 */
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX2,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    /* RX FIFO threshold: прерывание при 112 байт (из 128) — запас 16 байт */
+    uart_ll_set_rxfifo_full_thr(&UART1, 112);
+    uart_ll_set_rxfifo_full_thr(&UART2, 112);
+
+    /* Очистить FIFO */
+    uart_ll_rxfifo_rst(&UART1);
+    uart_ll_rxfifo_rst(&UART2);
+
+    /* Установить наши ISR — заменяют ISR ESP-IDF драйвера */
+    ESP_ERROR_CHECK(esp_intr_alloc(ETS_UART1_INTR_SOURCE,
+                                   ESP_INTR_FLAG_IRAM,
+                                   uart_rx_isr, (void *)0,
+                                   &s_ctx[0].intr_handle));
+    ESP_ERROR_CHECK(esp_intr_alloc(ETS_UART2_INTR_SOURCE,
+                                   ESP_INTR_FLAG_IRAM,
+                                   uart_rx_isr, (void *)1,
+                                   &s_ctx[1].intr_handle));
+
+    /* Включить прерывания: BREAK + FRM_ERR + FIFO_FULL + FIFO_OVF */
+    uart_ll_ena_intr_mask(&UART1, UART_HW_RX_ISR_FLAGS);
+    uart_ll_ena_intr_mask(&UART2, UART_HW_RX_ISR_FLAGS);
+
+    ESP_LOGI(TAG, "HW UART RX mode2: UART1(TX=GPIO%d,RX=GPIO%d) UART2(TX=GPIO%d,RX=GPIO%d)",
+             DMX_GPIO_TX1, DMX_GPIO_RX1, DMX_GPIO_TX2, DMX_GPIO_RX2);
+
+#else
+    /* Mode 0/1: UART driver только для TX (test/patcher mode) */
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, DMX_GPIO_TX1, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    QueueHandle_t q0;
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 0, 1024, 0, &q0, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 256, 0, NULL, 0));
 
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    QueueHandle_t q1;
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, 0, 1024, 0, &q1, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, 256, 256, 0, NULL, 0));
 
     ESP_LOGI(TAG, "TX UARTs on UART1=GPIO%d, UART2=GPIO%d",
              DMX_GPIO_TX1, DMX_GPIO_TX2);
+#endif
 }
 
 void uart_bypass_set_notify_task(int port, TaskHandle_t handle) {
@@ -688,6 +850,24 @@ void uart_bypass_set_tx_mode(int port, bool tx_mode) {
         rmt_enable(ctx->rmt_rx_chan);
     }
 #endif
+
+#if DMX_SW_UART_MODE == 2
+    uart_dev_t *hw = (port == 0) ? &UART1 : &UART2;
+    if (tx_mode) {
+        /* Отключить RX прерывания перед TX */
+        uart_ll_disable_intr_mask(hw, UART_HW_RX_ISR_FLAGS);
+    } else {
+        /* Очистить FIFO и состояние, включить RX прерывания */
+        portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+        uart_ll_rxfifo_rst(hw);
+        portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
+        ctx->rx_head = 0;
+        ctx->in_frame = false;
+        ctx->frame_ready = false;
+        ctx->last_break_us = 0;
+        uart_ll_ena_intr_mask(hw, UART_HW_RX_ISR_FLAGS);
+    }
+#endif
 }
 
 bool uart_bypass_get_frame(int port, uint8_t *out, int max_len, uint32_t *frame_len) {
@@ -711,4 +891,36 @@ uint32_t uart_bypass_get_break_count(int port) {
 
 uint32_t uart_bypass_get_ovf_count(int port) {
     return s_ctx[port].err_count;
+}
+
+uint32_t uart_bypass_get_last_sym0(int port) {
+    return s_ctx[port].last_sym0;
+}
+
+uint32_t uart_bypass_get_last_sym1(int port) {
+    return s_ctx[port].last_sym1;
+}
+
+uint32_t uart_bypass_get_last_num_symbols(int port) {
+    return s_ctx[port].last_num_symbols;
+}
+
+uint32_t uart_bypass_get_last_is_last(int port) {
+    return s_ctx[port].last_is_last;
+}
+
+uint32_t uart_bypass_get_last_symN_m1(int port) {
+    return s_ctx[port].last_symN_m1;
+}
+
+uint32_t uart_bypass_get_last_symN(int port) {
+    return s_ctx[port].last_symN;
+}
+
+uint32_t uart_bypass_get_break_search_found(int port) {
+    return s_ctx[port].break_search_found;
+}
+
+uint32_t uart_bypass_get_break_search_idx(int port) {
+    return s_ctx[port].break_search_idx;
 }
