@@ -10,8 +10,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "esp_rom_sys.h"
+#include "esp_cpu.h"
+#include "rom/ets_sys.h"
 #include "dmx_hal.h"
 #include "dmx.h"
 #include <string.h>
@@ -85,7 +85,7 @@ typedef struct {
 #if DMX_SW_UART_MODE == 2
     /* HW UART RX specific */
     bool in_frame;
-    int64_t last_break_us;
+    uint32_t last_break_cyc;
     intr_handle_t intr_handle;
 #endif
 } sw_uart_ctx_t;
@@ -511,10 +511,12 @@ static portMUX_TYPE s_global_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
  * ISR handler — вызывается из аппаратного прерывания UART.
  * Читает FIFO под глобальным spinlock → нет APB bus hang.
  */
+static IRAM_ATTR uart_dev_t *uart_hw_by_port[] = { &UART1, &UART2 };
+
 static void IRAM_ATTR uart_rx_isr(void *arg) {
     int port = (int)arg;
     sw_uart_ctx_t *ctx = &s_ctx[port];
-    uart_dev_t *hw = UART_LL_GET_HW(port);
+    uart_dev_t *hw = uart_hw_by_port[port];
 
     uint32_t int_st;
     while ((int_st = hw->int_st.val) != 0) {
@@ -545,10 +547,12 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             hw->int_clr.val = UART_BRK_DET_INT_CLR;
             ctx->break_count++;
 
-            int64_t now = esp_timer_get_time();
+            uint32_t now = esp_cpu_get_cycle_count();
 
-            /* Debounce: BREAK не может приходить чаще чем раз в 1мс */
-            if (now - ctx->last_break_us < 1000) {
+            /* Debounce: BREAK не может приходить чаще чем раз в 1мс
+             * CPUfreq 160-240MHz → 1ms = 160000-240000 cycles */
+            if (ctx->last_break_cyc != 0 &&
+                (now - ctx->last_break_cyc) < 160000) {
                 portENTER_CRITICAL_ISR(&s_global_fifo_mux);
                 while (uart_ll_get_rxfifo_len(hw)) {
                     (void)hw->fifo.val;
@@ -556,7 +560,7 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
                 portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
                 continue;
             }
-            ctx->last_break_us = now;
+            ctx->last_break_cyc = now;
 
             /* Сохранить предыдущий кадр */
             if (ctx->in_frame && ctx->rx_head > 0) {
@@ -655,7 +659,7 @@ void uart_bypass_init(int port) {
 
 #if DMX_SW_UART_MODE == 2
     ctx->in_frame = false;
-    ctx->last_break_us = 0;
+    ctx->last_break_cyc = 0;
     ctx->intr_handle = NULL;
 #endif
 }
@@ -864,7 +868,7 @@ void uart_bypass_set_tx_mode(int port, bool tx_mode) {
         ctx->rx_head = 0;
         ctx->in_frame = false;
         ctx->frame_ready = false;
-        ctx->last_break_us = 0;
+        ctx->last_break_cyc = 0;
         uart_ll_ena_intr_mask(hw, UART_HW_RX_ISR_FLAGS);
     }
 #endif
