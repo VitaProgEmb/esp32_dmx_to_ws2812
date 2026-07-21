@@ -527,17 +527,14 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             ctx->isr_count++;
 
             portENTER_CRITICAL_ISR(&s_global_fifo_mux);
-            uint32_t fifo_len = uart_ll_get_rxfifo_len(hw);
-            if (fifo_len > 0 && ctx->in_frame &&
-                ctx->rx_head + fifo_len <= DMX_CHANNELS + 1) {
-                uart_ll_read_rxfifo(hw, ctx->rx_active + ctx->rx_head, fifo_len);
-                ctx->rx_head += fifo_len;
-            } else if (fifo_len > 0) {
-                /* Не в кадре или overflow — дропаем */
-                while (uart_ll_get_rxfifo_len(hw)) {
-                    (void)hw->fifo.val;
+            while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
+                if (ctx->in_frame && ctx->rx_head <= DMX_CHANNELS) {
+                    ctx->rx_active[ctx->rx_head] = hw->fifo.rw_byte;
+                    ctx->rx_head++;
+                } else {
+                    (void)hw->fifo.rw_byte;
+                    if (ctx->in_frame) ctx->err_count++;
                 }
-                if (ctx->in_frame) ctx->err_count++;
             }
             portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
         }
@@ -554,13 +551,28 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             if (ctx->last_break_cyc != 0 &&
                 (now - ctx->last_break_cyc) < 160000) {
                 portENTER_CRITICAL_ISR(&s_global_fifo_mux);
-                while (uart_ll_get_rxfifo_len(hw)) {
-                    (void)hw->fifo.val;
+                while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
+                    (void)hw->fifo.rw_byte;
                 }
                 portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
                 continue;
             }
             ctx->last_break_cyc = now;
+
+            /* Дочитать остаток FIFO побайтно через rxfifo_cnt.
+             * Последние байты (ниже порога FIFO_FULL) сидят в FIFO,
+             * нужно забрать их ПЕРЕД сохранением кадра. */
+            portENTER_CRITICAL_ISR(&s_global_fifo_mux);
+            while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0 &&
+                   ctx->rx_head <= DMX_CHANNELS) {
+                ctx->rx_active[ctx->rx_head] = hw->fifo.rw_byte;
+                ctx->rx_head++;
+            }
+            /* Дропаем мусор если остался */
+            while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
+                (void)hw->fifo.rw_byte;
+            }
+            portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
 
             /* Сохранить предыдущий кадр */
             if (ctx->in_frame && ctx->rx_head > 0) {
@@ -578,13 +590,6 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             /* Сброс для нового кадра */
             ctx->rx_head = 0;
             ctx->in_frame = true;
-
-            /* Дропаем мусор из FIFO (BREAK может вызвать FRM_ERR + мусорные байты) */
-            portENTER_CRITICAL_ISR(&s_global_fifo_mux);
-            while (uart_ll_get_rxfifo_len(hw)) {
-                (void)hw->fifo.val;
-            }
-            portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
         }
 
         /* === FRM_ERR: ошибка кадра (нормально во время BREAK) === */
@@ -598,8 +603,8 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             ctx->err_count++;
 
             portENTER_CRITICAL_ISR(&s_global_fifo_mux);
-            while (uart_ll_get_rxfifo_len(hw)) {
-                (void)hw->fifo.val;
+            while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
+                (void)hw->fifo.rw_byte;
             }
             portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
         }
@@ -776,9 +781,10 @@ void uart_bypass_start_timer(void) {
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX2,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    /* RX FIFO threshold: прерывание при 112 байт (из 128) — запас 16 байт */
-    uart_ll_set_rxfifo_full_thr(&UART1, 112);
-    uart_ll_set_rxfifo_full_thr(&UART2, 112);
+    /* RX FIFO threshold: прерывание при 32 байтах — быстрое чтение,
+     * данные не застряют в FIFO к моменту BREAK */
+    uart_ll_set_rxfifo_full_thr(&UART1, 32);
+    uart_ll_set_rxfifo_full_thr(&UART2, 32);
 
     /* Очистить FIFO */
     uart_ll_rxfifo_rst(&UART1);
