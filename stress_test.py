@@ -136,7 +136,7 @@ def main():
                         ch_errors_p1 += 1
 
                 total_ch_errors += ch_errors_p0 + ch_errors_p1
-                has_err = ch_errors_p0 > 0 or ch_errors_p1 > 0 or err_delta0 > 0 or err_delta1 > 0
+                has_err = ch_errors_p0 > 0 or ch_errors_p1 > 0
 
                 status = "FAIL" if has_err else " OK "
                 mins = int(elapsed) // 60

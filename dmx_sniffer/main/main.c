@@ -157,6 +157,9 @@ void app_main(void) {
     xTaskCreatePinnedToCore(boot_button_task, "boot_btn", 4096, NULL, 2, NULL, 0);
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
 
+
+    
+
     vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_LOGI("MAIN", "Free heap: %lu, min: %lu", esp_get_free_heap_size(), esp_get_minimum_free_heap_size());
     web_server_init();
