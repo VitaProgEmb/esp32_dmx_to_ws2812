@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-15-minute stress test: send gradient on COM7, read from ESP32 every 5s, verify all 512 channels.
+15-minute stress test: send gradient on COM9, read from ESP32 every 5s, verify all 512 channels.
 """
 import serial
 import socket
@@ -9,7 +9,7 @@ import time
 import sys
 
 ESP32 = "192.168.1.100"
-COM_PORT = "COM7"
+COM_PORT = "COM9"
 BAUD = 250000
 DEBUG_PORT = 5555
 DMX_CHANNELS = 512
@@ -68,7 +68,7 @@ def query_debug():
 def main():
     print(f"=== STRESS TEST: {DURATION_SEC//60} minutes, gradient 512ch, 30fps ===\n")
 
-    print("Open COM7...")
+    print("Open COM9...")
     ser = serial.Serial(COM_PORT, BAUD, bytesize=8, stopbits=2, parity='N',
                         timeout=0, write_timeout=0)
     print("  OK\n")

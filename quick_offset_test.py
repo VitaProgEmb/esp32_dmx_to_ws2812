@@ -3,7 +3,7 @@
 import serial, socket, struct, time
 
 ESP32 = "192.168.1.100"
-COM_PORT = "COM7"
+COM_PORT = "COM9"
 BAUD = 250000
 DEBUG_PORT = 5555
 DMX_CHANNELS = 512

@@ -505,8 +505,7 @@ process_bits:
 static portMUX_TYPE s_global_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #define UART_HW_RX_ISR_FLAGS  (UART_BRK_DET_INT_ENA | UART_FRM_ERR_INT_ENA | \
-                                UART_RXFIFO_FULL_INT_ENA | UART_RXFIFO_OVF_INT_ENA | \
-                                UART_RXFIFO_TOUT_INT_ENA)
+                                UART_RXFIFO_FULL_INT_ENA | UART_RXFIFO_OVF_INT_ENA)
 
 /*
  * ISR handler — вызывается из аппаратного прерывания UART.
@@ -593,9 +592,7 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             ctx->in_frame = true;
         }
 
-        /* === FRM_ERR: ошибка кадра (нормально во время BREAK) ===
-         * err_wr_mask=1: UART не складывает ошибочные байты в FIFO,
-         * просто очищаем флаг. */
+        /* === FRM_ERR: ошибка кадра (нормально во время BREAK) === */
         if (int_st & UART_FRM_ERR_INT_ST) {
             hw->int_clr.val = UART_FRM_ERR_INT_CLR;
         }
@@ -610,25 +607,6 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
                 (void)hw->fifo.rw_byte;
             }
             portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
-        }
-
-        /* === RXFIFO_TOUT: RX idle timeout (MAB после BREAK) ===
-         * Когда RXD=HIGH ≥ threshold bit times (4мкс при 250kbaud),
-         * это MAB (pause 8-16мкс между BREAK и первым байтом).
-         * BREAK_DET срабатывает на 44мкс в BREAK (когда UART
-         * определяет break), но BREAK длится 88-176мкс.
-         * После BREAK_DET сбрасываем rx_head=0, и в FIFO продолжают
-         * поступать фантомные байты (LOW=start bits, err_wr_mask не
-         * работает). TOUT срабатывает в MAB и очищает FIFO. */
-        if (int_st & UART_RXFIFO_TOUT_INT_ST) {
-            hw->int_clr.val = UART_RXFIFO_TOUT_INT_CLR;
-            if (ctx->rx_head == 0) {
-                portENTER_CRITICAL_ISR(&s_global_fifo_mux);
-                while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
-                    (void)hw->fifo.rw_byte;
-                }
-                portEXIT_CRITICAL_ISR(&s_global_fifo_mux);
-            }
         }
     }
 }
@@ -799,12 +777,13 @@ void uart_bypass_start_timer(void) {
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
 #if DMX_RX_ROUTING_MATRIX
-    /* Routing matrix: оба UART RX на одном пине (GPIO15) */
+    /* Routing matrix: UART2 тоже слушает GPIO15 (как UART1) */
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX1,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_LOGI(TAG, "[MATRIX] UART2 RX routed to GPIO%d (same as UART1)", DMX_GPIO_RX1);
 #else
-    /* UART2: TX=GPIO17, RX=GPIO16 */
+    /* Normal: UART2 RX=GPIO16 */
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, DMX_GPIO_TX2, DMX_GPIO_RX2,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -814,20 +793,6 @@ void uart_bypass_start_timer(void) {
      * данные не застряют в FIFO к моменту BREAK */
     uart_ll_set_rxfifo_full_thr(&UART1, 32);
     uart_ll_set_rxfifo_full_thr(&UART2, 32);
-
-    /* RX idle threshold: 1 bit time (4мкс при 250kbaud).
-     * RXFIFO_TOUT срабатывает когда RXD=HIGH ≥4мкс после
-     * последнего принятого байта. В MAB (8-16мкс HIGH после BREAK)
-     * это清_fifo от фантомных байтов из BREAK.
-     * Между байтами DMX нет idle (back-to-back), TOUT не срабатывает. */
-    uart_ll_set_rx_idle_thr(&UART1, 1);
-    uart_ll_set_rx_idle_thr(&UART2, 1);
-
-    /* Запретить UART записывать ошибочные байты (frame error) в FIFO.
-     * Во время BREAK UART получает "фантомные" байты (LOW = start bit),
-     * они имеют frame error — не складываем их в FIFO. */
-    uart_ll_discard_error_data(&UART1, true);
-    uart_ll_discard_error_data(&UART2, true);
 
     /* Очистить FIFO */
     uart_ll_rxfifo_rst(&UART1);
@@ -843,7 +808,7 @@ void uart_bypass_start_timer(void) {
                                    uart_rx_isr, (void *)1,
                                    &s_ctx[1].intr_handle));
 
-    /* Включить прерывания: BREAK + FRM_ERR + FIFO_FULL + FIFO_OVF + TOUT */
+    /* Включить прерывания: BREAK + FRM_ERR + FIFO_FULL + FIFO_OVF */
     uart_ll_ena_intr_mask(&UART1, UART_HW_RX_ISR_FLAGS);
     uart_ll_ena_intr_mask(&UART2, UART_HW_RX_ISR_FLAGS);
 
