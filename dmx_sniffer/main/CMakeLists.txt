@@ -8,7 +8,6 @@ idf_component_register(SRCS
     "wifi_ap.c"
     "web_server.c"
     "settings_manager.c"
-    "debug_server.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver

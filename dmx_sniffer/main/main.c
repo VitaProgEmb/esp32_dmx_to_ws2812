@@ -18,7 +18,6 @@
 #include "wifi_ap.h"
 #include "web_server.h"
 #include "settings_manager.h"
-#include "debug_server.h"
 
 static const char *TAG = "MAIN";
 
@@ -152,7 +151,6 @@ void app_main(void) {
     wifi_init();
     dmx_hal_start();
 
-    xTaskCreatePinnedToCore((void*)debug_server_start, "dbg_srv", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(led_rainbow_task, "led_rainbow", 4096, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(boot_button_task, "boot_btn", 4096, NULL, 2, NULL, 0);
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
