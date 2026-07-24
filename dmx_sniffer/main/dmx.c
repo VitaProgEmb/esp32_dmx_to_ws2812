@@ -295,9 +295,10 @@ static void process_dmx_frame(int port, const uint8_t *slots, int num_slots) {
 /**
  * @brief Обработать DMX-кадр и обновить LED-ленты
  *
- * PARALLEL:   патч разделяется пополам — первые fixtures → Strip1 (своя
- *             интерполяция по strip1_count), вторые → Strip2 (своя по strip2_count).
- *             Два независимых мира в одном устройстве.
+ * PARALLEL:   обе ленты берут ВСЕ приборы [0..N) из таблицы патча
+ *             и распределяют по своей длине индивидуально.
+ *             Strip1: fixtures → count1 LED (своя интерполяция)
+ *             Strip2: fixtures → count2 LED (своя интерполяция)
  *
  * SEQUENTIAL: одна физическая лента (strip1 + strip2), патч распределяется
  *             по всей длине, интерполяция сквозная.
@@ -415,29 +416,30 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
 
     } else {
         /* === ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===
-         * Два независимых мира. Патч делят: первые fixtures → Strip1,
-         * остальные → Strip2. У каждой ленты СВОЯ интерполяция. */
+         * Обе ленты берут ВСЕ приборы [0..n_entries) из таблицы патча,
+         * но распределяют по своей длине индивидуально.
+         * Strip1: n fixtures → count1 LED (своя интерполяция)
+         * Strip2: n fixtures → count2 LED (своя интерполяция) */
 
         if (n_entries == 0) goto do_fallback;
 
-        /* Делим приборы: первые half1 → Strip1, остальные → Strip2 */
-        uint8_t half1 = n_entries / 2;
-        uint8_t half2 = n_entries - half1;
-
-        /* --- Strip 1: приборы [0..half1), распределённые по count1 LED --- */
-        if (count1 > 0 && half1 > 0) {
+        /* --- Strip 1: ВСЕ приборы [0..n_entries), распределённые по count1 LED --- */
+        if (count1 > 0) {
             if (interp) {
-                if (half1 < 2 || count1 <= 1) {
-                    led_color_t c = { stream_fixture_colors[0][0],
-                                      stream_fixture_colors[0][1],
-                                      stream_fixture_colors[0][2] };
+                if (n_entries < 2 || count1 <= 1) {
+                    led_color_t c = {0, 0, 0};
+                    if (n_entries > 0) {
+                        c.r = stream_fixture_colors[0][0];
+                        c.g = stream_fixture_colors[0][1];
+                        c.b = stream_fixture_colors[0][2];
+                    }
                     for (uint16_t i = 0; i < count1; i++) back1[i] = c;
                 } else {
                     for (uint16_t i = 0; i < count1; i++) {
-                        uint32_t pos_fp = (uint32_t)i * (half1 - 1) * 256 / (count1 - 1);
+                        uint32_t pos_fp = (uint32_t)i * (n_entries - 1) * 256 / (count1 - 1);
                         uint16_t lo = pos_fp >> 8;
                         uint16_t hi = lo + 1;
-                        if (hi >= half1) hi = half1 - 1;
+                        if (hi >= n_entries) hi = n_entries - 1;
                         uint8_t w = pos_fp & 0xFF;
                         back1[i].r = ((uint32_t)stream_fixture_colors[lo][0] * (256 - w) +
                                       (uint32_t)stream_fixture_colors[hi][0] * w) >> 8;
@@ -448,9 +450,9 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
                     }
                 }
             } else {
-                for (uint16_t f = 0; f < half1; f++) {
-                    uint16_t start = (uint32_t)f * count1 / half1;
-                    uint16_t next = (f + 1 < half1) ? (uint32_t)(f + 1) * count1 / half1 : count1;
+                for (uint16_t f = 0; f < n_entries; f++) {
+                    uint16_t start = (uint32_t)f * count1 / n_entries;
+                    uint16_t next = (f + 1 < n_entries) ? (uint32_t)(f + 1) * count1 / n_entries : count1;
                     led_color_t c = { stream_fixture_colors[f][0],
                                       stream_fixture_colors[f][1],
                                       stream_fixture_colors[f][2] };
@@ -459,18 +461,21 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
             }
         }
 
-        /* --- Strip 2: приборы [half1..n_entries), распределённые по count2 LED --- */
-        if (count2 > 0 && half2 > 0) {
+        /* --- Strip 2: ВСЕ приборы [0..n_entries), распределённые по count2 LED --- */
+        if (count2 > 0) {
             if (interp) {
-                if (half2 < 2 || count2 <= 1) {
-                    led_color_t c = { stream_fixture_colors[half1][0],
-                                      stream_fixture_colors[half1][1],
-                                      stream_fixture_colors[half1][2] };
+                if (n_entries < 2 || count2 <= 1) {
+                    led_color_t c = {0, 0, 0};
+                    if (n_entries > 0) {
+                        c.r = stream_fixture_colors[0][0];
+                        c.g = stream_fixture_colors[0][1];
+                        c.b = stream_fixture_colors[0][2];
+                    }
                     for (uint16_t i = 0; i < count2; i++) back2[i] = c;
                 } else {
                     for (uint16_t i = 0; i < count2; i++) {
-                        uint32_t pos_fp = (uint32_t)i * (half2 - 1) * 256 / (count2 - 1);
-                        uint16_t lo = (pos_fp >> 8) + half1;
+                        uint32_t pos_fp = (uint32_t)i * (n_entries - 1) * 256 / (count2 - 1);
+                        uint16_t lo = pos_fp >> 8;
                         uint16_t hi = lo + 1;
                         if (hi >= n_entries) hi = n_entries - 1;
                         uint8_t w = pos_fp & 0xFF;
@@ -483,13 +488,12 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
                     }
                 }
             } else {
-                for (uint16_t f = 0; f < half2; f++) {
-                    uint16_t gf = f + half1;
-                    uint16_t start = (uint32_t)f * count2 / half2;
-                    uint16_t next = (f + 1 < half2) ? (uint32_t)(f + 1) * count2 / half2 : count2;
-                    led_color_t c = { stream_fixture_colors[gf][0],
-                                      stream_fixture_colors[gf][1],
-                                      stream_fixture_colors[gf][2] };
+                for (uint16_t f = 0; f < n_entries; f++) {
+                    uint16_t start = (uint32_t)f * count2 / n_entries;
+                    uint16_t next = (f + 1 < n_entries) ? (uint32_t)(f + 1) * count2 / n_entries : count2;
+                    led_color_t c = { stream_fixture_colors[f][0],
+                                      stream_fixture_colors[f][1],
+                                      stream_fixture_colors[f][2] };
                     for (uint16_t j = start; j < next; j++) back2[j] = c;
                 }
             }
