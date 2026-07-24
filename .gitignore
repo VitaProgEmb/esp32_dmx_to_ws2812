@@ -6,3 +6,10 @@ sdkconfig
 sdkconfig.old
 .vscode/
 __pycache__/
+
+# Test files (local only)
+stress_test.cpp
+stress_test.exe
+stress_test.py
+test_device.py
+AccesToken.txt
