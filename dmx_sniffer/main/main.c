@@ -18,6 +18,7 @@
 #include "wifi_ap.h"
 #include "web_server.h"
 #include "settings_manager.h"
+#include "udp_test.h"
 
 static const char *TAG = "MAIN";
 
@@ -164,4 +165,5 @@ void app_main(void) {
 
     dmx_start_rx_task();
     dmx_start_tx_task();
+    udp_test_init();
 }

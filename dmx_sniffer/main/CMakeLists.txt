@@ -8,6 +8,7 @@ idf_component_register(SRCS
     "wifi_ap.c"
     "web_server.c"
     "settings_manager.c"
+    "udp_test.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -19,4 +20,5 @@ idf_component_register(SRCS
         json
         esp_timer
         app_update
+        lwip
 )
