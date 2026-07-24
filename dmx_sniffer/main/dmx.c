@@ -180,6 +180,7 @@ static void led_refresh_task(void *arg) {
             dmx_apply_fallback();
         }
         led_strip_refresh();
+        led_strip_refresh2();
     }
 }
 
@@ -291,121 +292,221 @@ static void process_dmx_frame(int port, const uint8_t *slots, int num_slots) {
     do_led_processing(port, slots, max_slot);
 }
 
+/**
+ * @brief Обработать DMX-кадр и обновить LED-ленты
+ *
+ * PARALLEL:   патч разделяется пополам — первые fixtures → Strip1 (своя
+ *             интерполяция по strip1_count), вторые → Strip2 (своя по strip2_count).
+ *             Два независимых мира в одном устройстве.
+ *
+ * SEQUENTIAL: одна физическая лента (strip1 + strip2), патч распределяется
+ *             по всей длине, интерполяция сквозная.
+ */
 static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot) {
 
     dmx_lock();
     dmx_mode_t mode = g_dmx.mode;
-    uint8_t cpf = DMX_FIXTURE_CH;           /* Каналов на прибор (3 для RGB) */
+    uint8_t cpf = DMX_FIXTURE_CH;
     uint8_t ch_order = g_dmx.channel_order;
     uint8_t n_entries = g_patch.count;
+    led_mode_t led_mode = g_led_mode;
     dmx_unlock();
 
-    /* Обрабатываем кадры только в режиме сниффера */
     if (mode != DMX_MODE_SNIFFER) return;
-
-    /* Если активен ручной тест LED — не трогаем ленту */
     if (g_led_test_mode != 0) return;
 
-    /* --- Шаг 1: Извлечь цвета приборов из DMX-каналов --- */
+    /* Извлечь цвета приборов из DMX-каналов */
     for (uint8_t f = 0; f < n_entries; f++) {
         dmx_lock();
-        uint8_t uni = g_patch.entries[f].universe;
         bool skip = g_patch.entries[f].skip;
+        uint16_t addr = g_patch.entries[f].dmx_addr;
+        uint8_t co = g_dmx.channel_order;
         dmx_unlock();
 
-        if (skip) continue;                          /* Прибор помечен как пропущенный */
-        int mapped_port = (uni == 2) ? 1 : 0;       /* Universe 2 → порт 1 */
-        if (mapped_port != port) continue;           /* Не наш порт — пропускаем */
+        if (skip) continue;
+        if (addr + cpf - 1 > max_slot) continue;
 
-        uint16_t addr = g_patch.entries[f].dmx_addr;
-        if (addr + cpf - 1 > max_slot) continue;    /* Адрес за пределами кадра */
-
-        /* Читаем 3 канала (R, G, B) и применяем порядок каналов.
-         * raw[] содержит цвет в "натуральном" порядке прибора,
-         * после s_order_map[] получаем порядок для WS2812B (RGB). */
+        dmx_lock();
         uint8_t raw[3] = { slots[addr - 1], slots[addr], slots[addr + 1] };
-        stream_fixture_colors[f][0] = raw[s_order_map[ch_order][0]];
-        stream_fixture_colors[f][1] = raw[s_order_map[ch_order][1]];
-        stream_fixture_colors[f][2] = raw[s_order_map[ch_order][2]];
+        dmx_unlock();
+        stream_fixture_colors[f][0] = raw[s_order_map[co][0]];
+        stream_fixture_colors[f][1] = raw[s_order_map[co][1]];
+        stream_fixture_colors[f][2] = raw[s_order_map[co][2]];
     }
 
-    /* --- Шаг 2: Записать цвета в back-буфер --- */
     led_strip_lock();
-    uint16_t num_fixtures = g_patch.count;
-    uint16_t num_leds = g_led_strip.count;
-    /* Определяем "тихий" буфер (в который пишем, пока RMT читает другой) */
-    led_color_t *back = (g_led_strip.colors == g_led_strip.bank_a)
-                      ? g_led_strip.bank_b : g_led_strip.bank_a;
+    uint16_t count1 = g_led_strip.count;
+    uint16_t count2 = g_led_strip2.count;
+    led_color_t *back1 = (g_led_strip.colors == g_led_strip.bank_a)
+                        ? g_led_strip.bank_b : g_led_strip.bank_a;
+    led_color_t *back2 = (g_led_strip2.colors == g_led_strip2.bank_a)
+                        ? g_led_strip2.bank_b : g_led_strip2.bank_a;
     led_strip_unlock();
 
     dmx_lock();
     bool interp = g_dmx.interpolate;
     dmx_unlock();
 
-    if (interp) {
-        /* --- ИНТЕРПОЛЯЦИЯ: плавное сглаживание между приборами --- */
-        if (num_fixtures < 2 || num_leds <= 1) {
-            /* 0-1 приборов: все пиксели = цвет первого прибора */
-            led_color_t color = {0, 0, 0};
-            if (num_fixtures > 0) {
-                color.r = stream_fixture_colors[0][0];
-                color.g = stream_fixture_colors[0][1];
-                color.b = stream_fixture_colors[0][2];
-            }
-            for (uint16_t i = 0; i < num_leds; i++)
-                back[i] = color;
-        } else {
-            /* 2+ приборов: линейная интерполяция между соседними.
-             * Каждый пиксель позиционируется на "оси" от 0 до (N-1),
-             * где целочисленная часть = индекс левого прибора,
-             * дробная = вес для линейной комбинации с правым прибором. */
-            for (uint16_t i = 0; i < num_leds; i++) {
-                uint32_t pos_fp = (uint32_t)i * (num_fixtures - 1) * 256 / (num_leds - 1);
-                uint16_t idx_low = pos_fp >> 8;         /* Целая часть = левый прибор */
-                uint16_t idx_high = idx_low + 1;        /* Правый прибор */
-                if (idx_high >= num_fixtures) idx_high = num_fixtures - 1;
-                uint8_t weight = pos_fp & 0xFF;         /* Дробная часть = вес (0-255) */
+    if (led_mode == LED_MODE_SEQUENTIAL) {
+        /* === ПОСЛЕДОВАТЕЛЬНЫЙ РЕЖИМ ===
+         * Одна лента: strip1 + strip2. Патч по всей длине, интерполяция сквозная. */
+        uint16_t total = count1 + count2;
+        if (total == 0) goto do_fallback;
 
-                /* Линейная интерполяция: result = left * (256-w) + right * w */
-                led_color_t color;
-                color.r = ((uint32_t)stream_fixture_colors[idx_low][0] * (256 - weight) +
-                           (uint32_t)stream_fixture_colors[idx_high][0] * weight) >> 8;
-                color.g = ((uint32_t)stream_fixture_colors[idx_low][1] * (256 - weight) +
-                           (uint32_t)stream_fixture_colors[idx_high][1] * weight) >> 8;
-                color.b = ((uint32_t)stream_fixture_colors[idx_low][2] * (256 - weight) +
-                           (uint32_t)stream_fixture_colors[idx_high][2] * weight) >> 8;
-                back[i] = color;
+        /* Временный буфер для общего изображения */
+        led_color_t *tmp = (count2 > 0) ? calloc(total, sizeof(led_color_t)) : back1;
+        if (!tmp) goto do_fallback;
+
+        if (interp) {
+            if (n_entries < 2 || total <= 1) {
+                led_color_t color = {0, 0, 0};
+                if (n_entries > 0) {
+                    color.r = stream_fixture_colors[0][0];
+                    color.g = stream_fixture_colors[0][1];
+                    color.b = stream_fixture_colors[0][2];
+                }
+                for (uint16_t i = 0; i < total; i++) tmp[i] = color;
+            } else {
+                for (uint16_t i = 0; i < total; i++) {
+                    uint32_t pos_fp = (uint32_t)i * (n_entries - 1) * 256 / (total - 1);
+                    uint16_t lo = pos_fp >> 8;
+                    uint16_t hi = lo + 1;
+                    if (hi >= n_entries) hi = n_entries - 1;
+                    uint8_t w = pos_fp & 0xFF;
+                    tmp[i].r = ((uint32_t)stream_fixture_colors[lo][0] * (256 - w) +
+                                (uint32_t)stream_fixture_colors[hi][0] * w) >> 8;
+                    tmp[i].g = ((uint32_t)stream_fixture_colors[lo][1] * (256 - w) +
+                                (uint32_t)stream_fixture_colors[hi][1] * w) >> 8;
+                    tmp[i].b = ((uint32_t)stream_fixture_colors[lo][2] * (256 - w) +
+                                (uint32_t)stream_fixture_colors[hi][2] * w) >> 8;
+                }
+            }
+        } else {
+            /* Пересчитать lookups по total для распределения */
+            uint16_t ws_start[PATCH_MAX_ENTRIES];
+            uint16_t ws_count[PATCH_MAX_ENTRIES];
+            for (uint16_t f = 0; f < n_entries; f++)
+                ws_start[f] = (uint32_t)f * total / n_entries;
+            for (uint16_t f = 0; f < n_entries; f++) {
+                uint16_t next = (f + 1 < n_entries) ? ws_start[f + 1] : total;
+                ws_count[f] = next - ws_start[f];
+            }
+            for (uint16_t pe = 0; pe < n_entries; pe++) {
+                led_color_t c = {
+                    .r = stream_fixture_colors[pe][0],
+                    .g = stream_fixture_colors[pe][1],
+                    .b = stream_fixture_colors[pe][2]
+                };
+                for (uint16_t j = 0; j < ws_count[pe]; j++) {
+                    uint16_t px = ws_start[pe] + j;
+                    if (px < total) tmp[px] = c;
+                }
             }
         }
+
+        if (g_led_test_mode != 0) { if (tmp != back1) free(tmp); return; }
+
+        /* Разрезаем по физическим лентам */
+        led_strip_lock();
+        if (count1 > 0) { memcpy(back1, tmp, count1 * sizeof(led_color_t)); led_strip_swap_banks(); }
+        if (count2 > 0) { memcpy(back2, tmp + count1, count2 * sizeof(led_color_t)); led_strip_swap_banks2(); }
+        led_strip_unlock();
+        if (tmp != back1) free(tmp);
+
     } else {
-        /* --- БЕЗ ИНТЕРПОЛЯЦИИ: каждый прибор占据 равный диапазон пикселей --- */
-        for (uint16_t pe = 0; pe < num_fixtures; pe++) {
-            uint16_t start = stream_ws_start[pe];
-            uint16_t count = stream_ws_count[pe];
-            led_color_t color = {
-                .r = stream_fixture_colors[pe][0],
-                .g = stream_fixture_colors[pe][1],
-                .b = stream_fixture_colors[pe][2]
-            };
-            for (uint16_t j = 0; j < count; j++) {
-                if (start + j < num_leds)
-                    back[start + j] = color;
+        /* === ПАРАЛЛЕЛЬНЫЙ РЕЖИМ ===
+         * Два независимых мира. Патч делят: первые fixtures → Strip1,
+         * остальные → Strip2. У каждой ленты СВОЯ интерполяция. */
+
+        if (n_entries == 0) goto do_fallback;
+
+        /* Делим приборы: первые half1 → Strip1, остальные → Strip2 */
+        uint8_t half1 = n_entries / 2;
+        uint8_t half2 = n_entries - half1;
+
+        /* --- Strip 1: приборы [0..half1), распределённые по count1 LED --- */
+        if (count1 > 0 && half1 > 0) {
+            if (interp) {
+                if (half1 < 2 || count1 <= 1) {
+                    led_color_t c = { stream_fixture_colors[0][0],
+                                      stream_fixture_colors[0][1],
+                                      stream_fixture_colors[0][2] };
+                    for (uint16_t i = 0; i < count1; i++) back1[i] = c;
+                } else {
+                    for (uint16_t i = 0; i < count1; i++) {
+                        uint32_t pos_fp = (uint32_t)i * (half1 - 1) * 256 / (count1 - 1);
+                        uint16_t lo = pos_fp >> 8;
+                        uint16_t hi = lo + 1;
+                        if (hi >= half1) hi = half1 - 1;
+                        uint8_t w = pos_fp & 0xFF;
+                        back1[i].r = ((uint32_t)stream_fixture_colors[lo][0] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][0] * w) >> 8;
+                        back1[i].g = ((uint32_t)stream_fixture_colors[lo][1] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][1] * w) >> 8;
+                        back1[i].b = ((uint32_t)stream_fixture_colors[lo][2] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][2] * w) >> 8;
+                    }
+                }
+            } else {
+                for (uint16_t f = 0; f < half1; f++) {
+                    uint16_t start = (uint32_t)f * count1 / half1;
+                    uint16_t next = (f + 1 < half1) ? (uint32_t)(f + 1) * count1 / half1 : count1;
+                    led_color_t c = { stream_fixture_colors[f][0],
+                                      stream_fixture_colors[f][1],
+                                      stream_fixture_colors[f][2] };
+                    for (uint16_t j = start; j < next; j++) back1[j] = c;
+                }
             }
         }
+
+        /* --- Strip 2: приборы [half1..n_entries), распределённые по count2 LED --- */
+        if (count2 > 0 && half2 > 0) {
+            if (interp) {
+                if (half2 < 2 || count2 <= 1) {
+                    led_color_t c = { stream_fixture_colors[half1][0],
+                                      stream_fixture_colors[half1][1],
+                                      stream_fixture_colors[half1][2] };
+                    for (uint16_t i = 0; i < count2; i++) back2[i] = c;
+                } else {
+                    for (uint16_t i = 0; i < count2; i++) {
+                        uint32_t pos_fp = (uint32_t)i * (half2 - 1) * 256 / (count2 - 1);
+                        uint16_t lo = (pos_fp >> 8) + half1;
+                        uint16_t hi = lo + 1;
+                        if (hi >= n_entries) hi = n_entries - 1;
+                        uint8_t w = pos_fp & 0xFF;
+                        back2[i].r = ((uint32_t)stream_fixture_colors[lo][0] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][0] * w) >> 8;
+                        back2[i].g = ((uint32_t)stream_fixture_colors[lo][1] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][1] * w) >> 8;
+                        back2[i].b = ((uint32_t)stream_fixture_colors[lo][2] * (256 - w) +
+                                      (uint32_t)stream_fixture_colors[hi][2] * w) >> 8;
+                    }
+                }
+            } else {
+                for (uint16_t f = 0; f < half2; f++) {
+                    uint16_t gf = f + half1;
+                    uint16_t start = (uint32_t)f * count2 / half2;
+                    uint16_t next = (f + 1 < half2) ? (uint32_t)(f + 1) * count2 / half2 : count2;
+                    led_color_t c = { stream_fixture_colors[gf][0],
+                                      stream_fixture_colors[gf][1],
+                                      stream_fixture_colors[gf][2] };
+                    for (uint16_t j = start; j < next; j++) back2[j] = c;
+                }
+            }
+        }
+
+        if (g_led_test_mode != 0) return;
+
+        led_strip_lock();
+        if (count1 > 0) led_strip_swap_banks();
+        if (count2 > 0) led_strip_swap_banks2();
+        led_strip_unlock();
     }
 
-    /* Повторная проверка тестового режима перед swap (защита от гонки) */
-    if (g_led_test_mode != 0) return;
-
-    /* Меняем буферы: back становится активным → led_ref его отобразит */
-    led_strip_swap_banks();
-
-    /* Сбрасываем fallback — DMX-кадр принят, сигнал есть */
+do_fallback:
     s_fallback_pending = false;
     xSemaphoreGive(s_led_refresh_sem);
 
-    /* Перезапускаем таймер fallback на следующий таймаут.
-     * Любой принятый кадр (даже все нули) = валидный DMX-сигнал. */
     dmx_lock();
     g_dmx.last_rx_ms[port] = (uint32_t)(esp_timer_get_time() / 1000);
     uint16_t fb_timeout = g_dmx.fallback_timeout_ms;

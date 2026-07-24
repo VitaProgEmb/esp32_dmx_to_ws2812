@@ -142,6 +142,8 @@ void app_main(void) {
     g_total_leds = g_led_strip.count;
 
     led_strip_init(g_led_strip.count);
+    led_strip_init2(g_led_strip.count);
+    g_total_leds = g_led_strip.count + g_led_strip2.count;
     led_strip_clear();
 
     patch_init();

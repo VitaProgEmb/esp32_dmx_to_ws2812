@@ -103,6 +103,8 @@ static void build_settings_json(char *json, size_t size) {
         "\"tx_mode\":\"%s\","
         "\"led_reverse\":%s,"
         "\"led_shift\":%d,"
+        "\"led_mode\":\"%s\","
+        "\"led_count2\":%d,"
         "\"channel_order\":%d,"
         "\"fallback_r\":%d,\"fallback_g\":%d,\"fallback_b\":%d,"
         "\"fallback_timeout_ms\":%d,"
@@ -120,6 +122,8 @@ static void build_settings_json(char *json, size_t size) {
         g_dmx.tx_mode == TX_MODE_FILL ? "fill" : "point",
         g_dmx.led_reverse ? "true" : "false",
         (int)g_dmx.led_shift,
+        g_led_mode == LED_MODE_SEQUENTIAL ? "sequential" : "parallel",
+        g_led_strip2.count,
         (int)g_dmx.channel_order,
         g_dmx.fallback_r, g_dmx.fallback_g, g_dmx.fallback_b,
         g_dmx.fallback_timeout_ms,
@@ -202,13 +206,40 @@ static esp_err_t api_leds_handler(httpd_req_t *req) {
         if (n < 1) n = 1;
         if (n > LED_STRIP_MAX_LEDS) n = LED_STRIP_MAX_LEDS;
         led_strip_lock();
-        g_total_leds = n;
         g_led_strip.count = n;
+        g_total_leds = g_led_strip.count + g_led_strip2.count;
         led_strip_unlock();
     }
     cJSON_Delete(root);
     dmx_recompute_lookups();
     led_strip_refresh();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+/** POST /api/leds2 — количество LED Strip 2 (GPIO5) */
+static esp_err_t api_leds2_handler(httpd_req_t *req) {
+    char buf[64];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body"); return ESP_FAIL; }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+
+    cJSON *cnt = cJSON_GetObjectItem(root, "count");
+    if (cJSON_IsNumber(cnt)) {
+        int n = cnt->valueint;
+        if (n < 0) n = 0;
+        if (n > LED_STRIP_MAX_LEDS) n = LED_STRIP_MAX_LEDS;
+        led_strip_lock();
+        g_led_strip2.count = n;
+        g_total_leds = g_led_strip.count + g_led_strip2.count;
+        led_strip_unlock();
+    }
+    cJSON_Delete(root);
+    dmx_recompute_lookups();
+    led_strip_refresh2();
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
@@ -539,6 +570,28 @@ static esp_err_t api_led_reverse_handler(httpd_req_t *req) {
         dmx_lock();
         g_dmx.led_reverse = cJSON_IsTrue(jrev);
         dmx_unlock();
+    }
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+/** POST /api/led_mode — переключить режим LED-лент (parallel/sequential)
+ *  {"mode":"parallel"}    — порт0→strip1, порт1→strip2 (независимо)
+ *  {"mode":"sequential"}  — оба порта → strip1 (2000 LED через 2 RMT) */
+static esp_err_t api_led_mode_handler(httpd_req_t *req) {
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body"); return ESP_FAIL; }
+    buf[len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_FAIL; }
+    cJSON *jmode = cJSON_GetObjectItem(root, "mode");
+    if (cJSON_IsString(jmode)) {
+        const char *m = jmode->valuestring;
+        if (strcmp(m, "parallel") == 0) g_led_mode = LED_MODE_PARALLEL;
+        else if (strcmp(m, "sequential") == 0) g_led_mode = LED_MODE_SEQUENTIAL;
     }
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -894,9 +947,11 @@ registered:
         { .uri = "/api/dmx_channels",    .method = HTTP_GET,  .handler = api_dmx_channels_handler },
         { .uri = "/api/mode",            .method = HTTP_POST, .handler = api_mode_handler },
         { .uri = "/api/leds",            .method = HTTP_POST, .handler = api_leds_handler },
+        { .uri = "/api/leds2",           .method = HTTP_POST, .handler = api_leds2_handler },
         { .uri = "/api/test",            .method = HTTP_POST, .handler = api_test_handler },
         { .uri = "/api/led_test",        .method = HTTP_POST, .handler = api_led_test_handler },
         { .uri = "/api/led_reverse",     .method = HTTP_POST, .handler = api_led_reverse_handler },
+        { .uri = "/api/led_mode",        .method = HTTP_POST, .handler = api_led_mode_handler },
         { .uri = "/api/led_shift",       .method = HTTP_POST, .handler = api_led_shift_handler },
         { .uri = "/api/dmx_addr_test",   .method = HTTP_POST, .handler = api_dmx_addr_test_handler },
         { .uri = "/api/fixture_settings",.method = HTTP_POST, .handler = api_fixture_settings_handler },

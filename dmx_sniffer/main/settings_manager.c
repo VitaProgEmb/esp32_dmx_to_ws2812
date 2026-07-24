@@ -27,6 +27,7 @@
  */
 
 #include "settings_manager.h"
+#include "led_strip.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
@@ -100,6 +101,13 @@ void settings_load(void) {
     if (nvs_get_i8(h, "interpolate", &i8_val) == ESP_OK) {
         g_dmx.interpolate = (i8_val != 0);
     }
+    uint8_t u8_led_mode;
+    if (nvs_get_u8(h, "led_mode", &u8_led_mode) == ESP_OK) {
+        if (u8_led_mode <= LED_MODE_SEQUENTIAL) g_led_mode = (led_mode_t)u8_led_mode;
+    }
+    if (nvs_get_u16(h, "led_cnt2", &u16_val) == ESP_OK) {
+        if (u16_val <= LED_STRIP_MAX_LEDS) g_led_strip2.count = u16_val;
+    }
 
     nvs_close(h);
 }
@@ -138,6 +146,8 @@ void settings_save(void) {
     // Save interpolation flag (bool stored as int8)
     int8_t i8_val = g_dmx.interpolate ? 1 : 0;
     nvs_set_i8(h, "interpolate", i8_val);
+    nvs_set_u8(h, "led_mode", (uint8_t)g_led_mode);
+    nvs_set_u16(h, "led_cnt2", g_led_strip2.count);
 
     nvs_commit(h);
     nvs_close(h);
