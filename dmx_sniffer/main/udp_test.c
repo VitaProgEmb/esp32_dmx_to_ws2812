@@ -1,102 +1,46 @@
 /**
  * @file udp_test.c
- * @brief UDP-сервер для стресс-тестирования DMX-приёмников
+ * @brief UDP-сервер: DMX readback + OTA
  *
- * ============================================================================
- * НАЗНАЧЕНИЕ
- * ============================================================================
- *
- * Этот модуль предоставляет высокоскоростной UDP-интерфейс для получения
- * данных обоих DMX-портов. Используется совместно с C++ тестовой программой
- * (stress_test.cpp) для длительного стресс-тестирования (15 минут, 30fps).
- *
- * ============================================================================
- * ЗАЧЕМ UDP, А НЕ HTTP
- * ============================================================================
- *
- * HTTP-запрос к /api/blob занимает ~60мс (TCP handshake + HTTP headers + send).
- * При 30fps каждый кадр = 33мс. HTTP не успевает — реальный FPS падает до 15.
- *
- * UDP-запрос: 1 байт отправка + 1024 байта ответ = ~0.1мс.
- * Это позволяет достичь реальных 30fps в стресс-тесте.
- *
- * ============================================================================
- * ПРОТОКОЛ
- * ============================================================================
- *
- * Формат запроса (PC -> ESP):
- *   [0x01]                    — команда "get blob" (1 байт)
- *
- * Формат ответа (ESP -> PC):
- *   [P0: 512 байт]           — данные порта 0 (каналы 1-512)
- *   [P1: 512 байт]           — данные порта 1 (каналы 1-512)
- *   Итого: 1024 байта
- *
- * PC-программа отправляет 0x01 и получает 1024 байта.
- * Сравнивает P0[i] с P1[i] для каждого канала.
- *
- * ============================================================================
- * АРХИТЕКТУРА
- * ============================================================================
- *
- * Задача FreeRTOS (udp_test_task):
- *   - Ядро 1 (приоритет 5 — выше HTTP, но ниже ISR)
- *   - Блокируется на recvfrom() — ждёт UDP-пакет
- *   - При получении 0x01: копирует данные обоих портов и отправляет ответ
- *   - Использует dmx_get_channel_data() — потокобезопасное чтение из s_rx_buf[]
- *
- * Инициализация:
- *   udp_test_init() вызывается из app_main() после dmx_start_rx_task().
- *   Создаёт задачу и начинает прослушивание UDP-порта 5124.
- *
- * ============================================================================
- * ПРОВОДНАЯ СХЕМА ДЛЯ ТЕСТА
- * ============================================================================
- *
- * COM9 TX (FT2232) ──┬── GPIO15 (RX1, порт 0)
- *                    └── GPIO16 (RX2, порт 1)
- *
- * Оба UART-приёмника слушают один и тот же источник данных.
- * Routing matrix = 0 (нормальный режим): порт0→GPIO15, порт1→GPIO16.
- * Сравнение P0 vs P1 проверяет корректность обоих приёмников.
+ * Протокол:
+ *   0x01 — get blob:     ESP → P0[512] + P1[512] = 1024 байта
+ *   0x02 — OTA begin:    [total_size:4] → ACK 0xAA
+ *   0x03 — OTA chunk:    [seq:2][data:N] → ACK [seq:2]
+ *   0x04 — OTA end:      → перезагрузка
  */
 
 #include "udp_test.h"
-#include "dmx.h"
+#include "dmx/dmx_bus.h"
 #include "settings.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include <string.h>
 
-/** UDP-порт сервера (5124 — не пересекается с HTTP=80, mDNS=5353) */
-#define UDP_PORT 5124
+#define UDP_PORT    5124
+#define CHUNK_SIZE  1024
+#define TAG         "UDP_OTA"
 
-/** Тег для логов ESP-IDF */
-#define TAG "UDP_TEST"
+static esp_ota_handle_t s_ota_handle = 0;
+static const esp_partition_t *s_ota_partition = NULL;
+static uint32_t s_ota_total = 0;
+static uint32_t s_ota_written = 0;
+static uint16_t s_ota_last_seq = 0;
+static bool s_ota_active = false;
 
-/**
- * @brief Задача UDP-сервера для стресс-теста
- *
- * Цикл:
- *   1. recvfrom() — блокирующее ожидание UDP-пакета от PC
- *   2. Если команда = 0x01 → копировать P0+P1 в ответный буфер
- *   3. sendto() — отправить 1024 байта обратно на PC
- *
- * @param arg Не используется (NULL)
- */
 static void udp_test_task(void *arg) {
-    /* Создание UDP-сокета */
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "socket create failed: errno %d", errno);
+        ESP_LOGE(TAG, "socket failed: errno %d", errno);
         vTaskDelete(NULL);
         return;
     }
 
-    /* Привязка к порту 5124 на всех интерфейсах (INADDR_ANY) */
     struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(UDP_PORT),
@@ -110,53 +54,121 @@ static void udp_test_task(void *arg) {
         return;
     }
 
-    ESP_LOGI(TAG, "UDP listening on port %d", UDP_PORT);
+    ESP_LOGI(TAG, "UDP listening on port %d (DMX + OTA)", UDP_PORT);
 
-    /**
-     * Ответный буфер: P0[512] + P1[512] = 1024 байта.
-     * Статический (не в стеке) чтобы не нагружать FreeRTOS heap.
-     */
+    uint8_t buf[CHUNK_SIZE + 16];
     uint8_t resp[1024];
 
-    /* Основной цикл: обработка запросов */
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
-        uint8_t cmd;
 
-        /* Блокирующее ожидание UDP-пакета (бесконечный таймаут) */
-        int len = recvfrom(sock, &cmd, 1, 0,
+        int len = recvfrom(sock, buf, sizeof(buf), 0,
                           (struct sockaddr *)&client_addr, &addr_len);
         if (len <= 0) continue;
 
-        /* Команда 0x01: "get blob" — вернуть данные обоих DMX-портов */
-        if (cmd == 0x01) {
-            /* dmx_get_channel_data() — потокобезопасное чтение из s_rx_buf[]
-             * через spinlock. Не блокирует ISR, не вызывает дрифта. */
-            dmx_get_channel_data(0, resp, DMX_CHANNELS);
-            dmx_get_channel_data(1, resp + DMX_CHANNELS, DMX_CHANNELS);
+        uint8_t cmd = buf[0];
 
-            /* Отправка ответа: 1024 байта (P0 + P1) */
+        /* --- 0x01: DMX blob readback --- */
+        if (cmd == 0x01) {
+            memcpy(resp, g_raw_frames[0].data, DMX_CHANNELS);
+            memcpy(resp + DMX_CHANNELS, g_raw_frames[1].data, DMX_CHANNELS);
             sendto(sock, resp, sizeof(resp), 0,
                    (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        /* --- 0x02: OTA begin --- */
+        else if (cmd == 0x02 && len >= 5) {
+            s_ota_total = (buf[1] << 24) | (buf[2] << 16) | (buf[3] << 8) | buf[4];
+            s_ota_written = 0;
+            s_ota_last_seq = 0;
+            s_ota_active = false;
+
+            s_ota_partition = esp_ota_get_next_update_partition(NULL);
+            if (!s_ota_partition) {
+                ESP_LOGE(TAG, "OTA: no partition found");
+                uint8_t nack = 0xFF;
+                sendto(sock, &nack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+                continue;
+            }
+
+            esp_err_t err = esp_ota_begin(s_ota_partition, s_ota_total, &s_ota_handle);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+                uint8_t nack = 0xFF;
+                sendto(sock, &nack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+                continue;
+            }
+
+            s_ota_active = true;
+            ESP_LOGI(TAG, "OTA begin: %lu bytes, partition: %s",
+                     (unsigned long)s_ota_total, s_ota_partition->label);
+
+            uint8_t ack = 0xAA;
+            sendto(sock, &ack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        /* --- 0x03: OTA chunk --- */
+        else if (cmd == 0x03 && s_ota_active && len >= 3) {
+            uint16_t seq = (buf[1] << 8) | buf[2];
+            uint8_t *data = buf + 3;
+            int data_len = len - 3;
+
+            if (seq == s_ota_last_seq + 1) {
+                esp_err_t err = esp_ota_write(s_ota_handle, data, data_len);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "OTA write failed at seq %u: %s", seq, esp_err_to_name(err));
+                    s_ota_active = false;
+                    esp_ota_abort(s_ota_handle);
+                    continue;
+                }
+                s_ota_written += data_len;
+                s_ota_last_seq = seq;
+
+                if (s_ota_written % (10 * CHUNK_SIZE) == 0 || s_ota_written >= s_ota_total) {
+                    ESP_LOGI(TAG, "OTA progress: %lu / %lu bytes (%d%%)",
+                             (unsigned long)s_ota_written, (unsigned long)s_ota_total,
+                             (int)(s_ota_written * 100 / s_ota_total));
+                }
+            }
+
+            /* ACK: вернуть seq */
+            uint8_t ack[3] = {0x06, buf[1], buf[2]};
+            sendto(sock, ack, 3, 0, (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        /* --- 0x04: OTA end --- */
+        else if (cmd == 0x04 && s_ota_active) {
+            esp_err_t err = esp_ota_end(s_ota_handle);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "OTA end failed: %s", esp_err_to_name(err));
+                uint8_t nack = 0xFF;
+                sendto(sock, &nack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+                s_ota_active = false;
+                continue;
+            }
+
+            err = esp_ota_set_boot_partition(s_ota_partition);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "set_boot_partition failed: %s", esp_err_to_name(err));
+                uint8_t nack = 0xFF;
+                sendto(sock, &nack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+                s_ota_active = false;
+                continue;
+            }
+
+            ESP_LOGI(TAG, "OTA complete! %lu bytes written. Rebooting...",
+                     (unsigned long)s_ota_written);
+
+            uint8_t ack = 0xAA;
+            sendto(sock, &ack, 1, 0, (struct sockaddr *)&client_addr, addr_len);
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
         }
     }
 }
 
-/**
- * @brief Инициализация UDP-тест-сервера
- *
- * Вызывается из app_main() после запуска RX-задач.
- * Создаёт задачу udp_test_task на ядре 1 (приоритет 5).
- *
- * Ядро 1 выбрано потому что:
- *   - Ядро 0: HTTP-сервер, Wi-Fi, LED, boot-button
- *   - Ядро 1: DMX ISR, RX/TX задачи, UDP-тест
- *   - UDP-задача работает на том же ядре что и ISR — минимальная задержка
- *     при чтении s_rx_buf[] (нет миграции между ядрами)
- *
- * Стек 4096 байт достаточен для UDP-операций (lwip не требует много RAM).
- */
 void udp_test_init(void) {
-    xTaskCreatePinnedToCore(udp_test_task, "udp_test", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(udp_test_task, "udp_test", 8192, NULL, 5, NULL, 1);
 }

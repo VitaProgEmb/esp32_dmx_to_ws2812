@@ -9,6 +9,8 @@ idf_component_register(SRCS
     "web_server.c"
     "settings_manager.c"
     "udp_test.c"
+    "dmx/dmx_rx.c"
+    "led_driver/ws2812.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
