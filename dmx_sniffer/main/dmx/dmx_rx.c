@@ -7,10 +7,13 @@
  *                                      │ notify
  *                                      ▼
  *                                dmx_rx_task
- *                                (копирует под spinlock)
+ *                                (копирует под portENTER_CRITICAL)
  *                                      │
  *                            g_raw_frames[port]
  *                            xEventGroupSetBits()
+ *
+ * Важно: spinlock НЕ используется в ISR — каждый UART читает свой FIFO,
+ * ISR атомарен на уровне приоритета прерывания.
  */
 
 #include "dmx_rx.h"
@@ -31,7 +34,6 @@
 static const char *TAG = "DMX_RX";
 
 #define UART_BAUD_RATE       250000
-#define FIFO_FULL_THR        64
 #define BREAK_DEBOUNCE_CYCLES 160000
 
 #define RX_ISR_FLAGS (UART_BRK_DET_INT_ENA | UART_FRM_ERR_INT_ENA | \
@@ -54,6 +56,7 @@ typedef struct {
     int               rx_pin;
     int               tx_pin;
     int               dir_pin;
+    int               fifo_thr;
     portMUX_TYPE      mux;
 } dmx_rx_ctx_t;
 
@@ -61,6 +64,7 @@ static dmx_rx_ctx_t s_ctx[2];
 
 EventGroupHandle_t g_dmx_events;
 dmx_raw_frame_t    g_raw_frames[2];
+dmx_ck_ring_t      g_ck_rings[2];
 
 volatile uint32_t g_isr_count[2] = {0, 0};
 volatile uint32_t g_break_count[2] = {0, 0};
@@ -80,7 +84,6 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
         if (int_st & UART_RXFIFO_FULL_INT_ST) {
             hw->int_clr.val = UART_RXFIFO_FULL_INT_CLR;
 
-            portENTER_CRITICAL_ISR(&ctx->mux);
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
                 if (ctx->in_frame && ctx->frame_len < DMX_FRAME_LEN) {
                     ctx->rx_active[ctx->frame_len++] = hw->fifo.rw_byte;
@@ -88,7 +91,6 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
                     (void)hw->fifo.rw_byte;
                 }
             }
-            portEXIT_CRITICAL_ISR(&ctx->mux);
         }
 
         if (int_st & UART_BRK_DET_INT_ST) {
@@ -97,17 +99,14 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             uint32_t now = esp_cpu_get_cycle_count();
             if (ctx->last_break_cyc != 0 &&
                 (now - ctx->last_break_cyc) < BREAK_DEBOUNCE_CYCLES) {
-                portENTER_CRITICAL_ISR(&ctx->mux);
                 while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
                     (void)hw->fifo.rw_byte;
                 }
-                portEXIT_CRITICAL_ISR(&ctx->mux);
                 continue;
             }
             ctx->last_break_cyc = now;
             g_break_count[port]++;
 
-            portENTER_CRITICAL_ISR(&ctx->mux);
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0 &&
                    ctx->frame_len < DMX_FRAME_LEN) {
                 ctx->rx_active[ctx->frame_len++] = hw->fifo.rw_byte;
@@ -115,7 +114,6 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
                 (void)hw->fifo.rw_byte;
             }
-            portEXIT_CRITICAL_ISR(&ctx->mux);
 
             if (ctx->in_frame && ctx->frame_len > 0) {
                 if (!ctx->sync) {
@@ -142,11 +140,9 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             hw->int_clr.val = UART_RXFIFO_OVF_INT_CLR;
             ctx->in_frame = false;
             ctx->frame_len = 0;
-            portENTER_CRITICAL_ISR(&ctx->mux);
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
                 (void)hw->fifo.rw_byte;
             }
-            portEXIT_CRITICAL_ISR(&ctx->mux);
         }
     }
 }
@@ -175,6 +171,21 @@ static void dmx_rx_task(void *arg) {
         g_raw_frames[port].len = len - 1;
         g_raw_frames[port].timestamp_ms = now;
 
+        /* Checksum ring buffer — записываем для кадров >= 100 байт */
+        if (len >= 100) {
+            uint16_t ck_xor = 0, ck_sum = 0;
+            for (int i = 1; i < len; i++) {
+                ck_xor ^= local[i];
+                ck_sum += local[i];
+            }
+            dmx_ck_ring_t *ring = &g_ck_rings[port];
+            uint32_t idx = ring->count & (CK_RING_SIZE - 1);
+            ring->buf[idx].xor_val = ck_xor;
+            ring->buf[idx].sum_val = ck_sum;
+            ring->buf[idx].frame_len = len;
+            ring->count++;
+        }
+
         xEventGroupSetBits(g_dmx_events, port == 0 ? DMX_EVT_FRAME0 : DMX_EVT_FRAME1);
     }
 }
@@ -190,6 +201,7 @@ void dmx_rx_init(int port, const dmx_rx_cfg_t *cfg) {
     s_ctx[port].tx_pin   = cfg->tx_pin;
     s_ctx[port].dir_pin  = cfg->dir_pin;
     s_ctx[port].uart_num = cfg->uart_num;
+    s_ctx[port].fifo_thr = cfg->fifo_thr;
     s_ctx[port].enabled  = true;
     portMUX_INITIALIZE(&s_ctx[port].mux);
 }
@@ -214,12 +226,13 @@ void dmx_rx_start(void) {
         ESP_ERROR_CHECK(uart_set_pin(ctx->uart_num, ctx->tx_pin, ctx->rx_pin,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-        uart_ll_set_rxfifo_full_thr(hw, FIFO_FULL_THR);
+        uart_ll_set_rxfifo_full_thr(hw, ctx->fifo_thr);
         uart_ll_rxfifo_rst(hw);
 
         ESP_ERROR_CHECK(esp_intr_alloc(
             port == 0 ? ETS_UART1_INTR_SOURCE : ETS_UART2_INTR_SOURCE,
-            ESP_INTR_FLAG_IRAM, uart_rx_isr, (void *)port, &ctx->intr_handle));
+            ESP_INTR_FLAG_IRAM,
+            uart_rx_isr, (void *)port, &ctx->intr_handle));
 
         uart_ll_ena_intr_mask(hw, RX_ISR_FLAGS);
 
@@ -252,9 +265,7 @@ void dmx_rx_enable(int port, bool enable) {
     ctx->enabled = enable;
 
     if (enable) {
-        portENTER_CRITICAL_ISR(&ctx->mux);
         uart_ll_rxfifo_rst(hw);
-        portEXIT_CRITICAL_ISR(&ctx->mux);
         ctx->in_frame = false;
         ctx->frame_len = 0;
         ctx->last_break_cyc = 0;
@@ -262,9 +273,7 @@ void dmx_rx_enable(int port, bool enable) {
         uart_ll_ena_intr_mask(hw, RX_ISR_FLAGS);
     } else {
         uart_ll_disable_intr_mask(hw, RX_ISR_FLAGS);
-        portENTER_CRITICAL_ISR(&ctx->mux);
         uart_ll_rxfifo_rst(hw);
-        portEXIT_CRITICAL_ISR(&ctx->mux);
     }
 
     ESP_LOGI(TAG, "port%d %s", port, enable ? "ENABLED" : "DISABLED");

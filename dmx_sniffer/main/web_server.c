@@ -921,7 +921,7 @@ static esp_err_t api_reboot_handler(httpd_req_t *req) {
  */
 esp_err_t web_server_init(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
     config.send_wait_timeout = 30;

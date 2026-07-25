@@ -87,13 +87,24 @@ esp_err_t wifi_init(void) {
 
 esp_err_t wifi_toggle(void) {
     if (s_wifi_enabled) {
-        s_wifi_enabled = false;
-        esp_wifi_disconnect();
-        esp_wifi_stop();
+        return wifi_stop();
     } else {
-        s_wifi_enabled = true;
-        esp_wifi_start();
+        return wifi_start();
     }
+}
+
+esp_err_t wifi_stop(void) {
+    ESP_LOGI(TAG, "WiFi STOP");
+    s_wifi_enabled = false;
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    return ESP_OK;
+}
+
+esp_err_t wifi_start(void) {
+    ESP_LOGI(TAG, "WiFi START");
+    s_wifi_enabled = true;
+    esp_wifi_start();
     return ESP_OK;
 }
 

@@ -1,12 +1,15 @@
 /**
  * @file udp_test.c
- * @brief UDP-сервер: DMX readback + OTA
+ * @brief UDP-сервер: DMX readback + checksum + OTA
  *
  * Протокол:
  *   0x01 — get blob:     ESP → P0[512] + P1[512] = 1024 байта
  *   0x02 — OTA begin:    [total_size:4] → ACK 0xAA
  *   0x03 — OTA chunk:    [seq:2][data:N] → ACK [seq:2]
  *   0x04 — OTA end:      → перезагрузка
+ *   0x05 — get checksum: ESP → [p0_xor:2][p0_sum:2][p1_xor:2][p1_sum:2] = 8 байт
+ *   0x06 — ck report:    ESP → [p0_count:4][p1_count:4][p0_ck:N×6][p1_ck:M×6]
+ *                        каждая ck запись: [xor:2][sum:2][frame_len:2]
  */
 
 #include "udp_test.h"
@@ -24,7 +27,7 @@
 
 #define UDP_PORT    5124
 #define CHUNK_SIZE  1024
-#define TAG         "UDP_OTA"
+#define TAG         "UDP"
 
 static esp_ota_handle_t s_ota_handle = 0;
 static const esp_partition_t *s_ota_partition = NULL;
@@ -57,7 +60,7 @@ static void udp_test_task(void *arg) {
     ESP_LOGI(TAG, "UDP listening on port %d (DMX + OTA)", UDP_PORT);
 
     uint8_t buf[CHUNK_SIZE + 16];
-    uint8_t resp[1024];
+    static uint8_t resp[16384];
 
     while (1) {
         struct sockaddr_in client_addr;
@@ -73,7 +76,63 @@ static void udp_test_task(void *arg) {
         if (cmd == 0x01) {
             memcpy(resp, g_raw_frames[0].data, DMX_CHANNELS);
             memcpy(resp + DMX_CHANNELS, g_raw_frames[1].data, DMX_CHANNELS);
-            sendto(sock, resp, sizeof(resp), 0,
+            sendto(sock, resp, DMX_CHANNELS * 2, 0,
+                   (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        /* --- 0x05: DMX checksum readback (быстро, 8 байт) --- */
+        else if (cmd == 0x05) {
+            uint16_t p0_xor = 0, p0_sum = 0;
+            uint16_t p1_xor = 0, p1_sum = 0;
+            const uint8_t *d0 = g_raw_frames[0].data;
+            const uint8_t *d1 = g_raw_frames[1].data;
+            uint16_t len0 = g_raw_frames[0].len;
+            uint16_t len1 = g_raw_frames[1].len;
+            for (int i = 0; i < len0; i++) { p0_xor ^= d0[i]; p0_sum += d0[i]; }
+            for (int i = 0; i < len1; i++) { p1_xor ^= d1[i]; p1_sum += d1[i]; }
+            uint8_t ck[8] = {
+                p0_xor >> 8, p0_xor & 0xFF,
+                p0_sum >> 8, p0_sum & 0xFF,
+                p1_xor >> 8, p1_xor & 0xFF,
+                p1_sum >> 8, p1_sum & 0xFF,
+            };
+            sendto(sock, ck, sizeof(ck), 0,
+                   (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        /* --- 0x06: checksum ring buffer report --- */
+        else if (cmd == 0x06) {
+            uint32_t n0 = g_ck_rings[0].count;
+            uint32_t n1 = g_ck_rings[1].count;
+            uint32_t c0 = n0 > CK_RING_SIZE ? CK_RING_SIZE : n0;
+            uint32_t c1 = n1 > CK_RING_SIZE ? CK_RING_SIZE : n1;
+
+            /* Header: big-endian [p0_count:4][p1_count:4] */
+            resp[0] = c0 >> 24; resp[1] = c0 >> 16; resp[2] = c0 >> 8; resp[3] = c0;
+            resp[4] = c1 >> 24; resp[5] = c1 >> 16; resp[6] = c1 >> 8; resp[7] = c1;
+
+            uint8_t *p = resp + 8;
+            for (uint32_t i = 0; i < c0; i++) {
+                uint32_t idx = (n0 - c0 + i) & (CK_RING_SIZE - 1);
+                uint16_t x = g_ck_rings[0].buf[idx].xor_val;
+                uint16_t s = g_ck_rings[0].buf[idx].sum_val;
+                uint16_t fl = g_ck_rings[0].buf[idx].frame_len;
+                *p++ = x >> 8;  *p++ = x & 0xFF;
+                *p++ = s >> 8;  *p++ = s & 0xFF;
+                *p++ = fl >> 8; *p++ = fl & 0xFF;
+            }
+            for (uint32_t i = 0; i < c1; i++) {
+                uint32_t idx = (n1 - c1 + i) & (CK_RING_SIZE - 1);
+                uint16_t x = g_ck_rings[1].buf[idx].xor_val;
+                uint16_t s = g_ck_rings[1].buf[idx].sum_val;
+                uint16_t fl = g_ck_rings[1].buf[idx].frame_len;
+                *p++ = x >> 8;  *p++ = x & 0xFF;
+                *p++ = s >> 8;  *p++ = s & 0xFF;
+                *p++ = fl >> 8; *p++ = fl & 0xFF;
+            }
+
+            int total = 8 + (c0 + c1) * 6;
+            sendto(sock, resp, total, 0,
                    (struct sockaddr *)&client_addr, addr_len);
         }
 

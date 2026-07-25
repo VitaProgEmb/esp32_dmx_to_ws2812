@@ -16,6 +16,7 @@ typedef struct {
     int tx_pin;       /**< GPIO передачи (направление RS485) */
     int dir_pin;      /**< GPIO DE/RE, -1 = нет управления */
     int uart_num;     /**< UART_NUM_1 или UART_NUM_2 */
+    int fifo_thr;     /**< Порог FIFO_FULL (разный для портов!) */
 } dmx_rx_cfg_t;
 
 /**

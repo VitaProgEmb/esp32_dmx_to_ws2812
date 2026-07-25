@@ -10,4 +10,6 @@
 
 esp_err_t wifi_init(void);
 esp_err_t wifi_toggle(void);
+esp_err_t wifi_stop(void);
+esp_err_t wifi_start(void);
 bool wifi_is_on(void);

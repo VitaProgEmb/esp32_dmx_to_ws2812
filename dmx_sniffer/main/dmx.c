@@ -408,10 +408,8 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
         if (g_led_test_mode != 0) { if (tmp != back1) free(tmp); return; }
 
         /* Разрезаем по физическим лентам */
-        led_strip_lock();
-        if (count1 > 0) { memcpy(back1, tmp, count1 * sizeof(led_color_t)); led_strip_swap_banks(); }
-        if (count2 > 0) { memcpy(back2, tmp + count1, count2 * sizeof(led_color_t)); led_strip_swap_banks2(); }
-        led_strip_unlock();
+        if (count1 > 0) { led_strip_lock(); memcpy(back1, tmp, count1 * sizeof(led_color_t)); led_strip_unlock(); led_strip_swap_banks(); }
+        if (count2 > 0) { led_strip_lock(); memcpy(back2, tmp + count1, count2 * sizeof(led_color_t)); led_strip_unlock(); led_strip_swap_banks2(); }
         if (tmp != back1) free(tmp);
 
     } else {
@@ -501,10 +499,8 @@ static void do_led_processing(int port, const uint8_t *slots, uint16_t max_slot)
 
         if (g_led_test_mode != 0) return;
 
-        led_strip_lock();
         if (count1 > 0) led_strip_swap_banks();
         if (count2 > 0) led_strip_swap_banks2();
-        led_strip_unlock();
     }
 
 do_fallback:
@@ -556,7 +552,6 @@ static void dmx_stream_rx_task(void *arg) {
         if (uart_bypass_get_frame(port, buf, sizeof(buf), &frame_len) && frame_len > 0) {
             dmx_process_frame(port, buf + 1, frame_len - 1);
         }
-        dmx_process_leds(port);
     }
 }
 

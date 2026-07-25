@@ -556,6 +556,11 @@ process_bits:
  * с двух ядер вызывает "APB bus hang" (см. errata CPU-3.21). */
 static portMUX_TYPE s_global_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
 
+/** Глобальный счётчик ISR — инкрементируется КАЖДОЕ прерывание (FIFO_FULL, BREAK, FRM_ERR, OVF).
+ *  Задача dmx_stream_rx_task проверяет его чтобы понять — ISR жив или нет.
+ *  Не требует мьютекса (атомарный read в задаче). */
+volatile uint32_t g_isr_tick = 0;
+
 /* Маска прерываний UART для приёма DMX:
  *   BREAK_DET  — обнаружен break (≥88мкс LOW) → начало нового кадра
  *   FRM_ERR    — ошибка кадра (стоп-бит != 1) → фантом во время break
@@ -572,6 +577,8 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
     int port = (int)arg;
     sw_uart_ctx_t *ctx = &s_ctx[port];
     uart_dev_t *hw = uart_hw_by_port[port];
+
+    g_isr_tick++;  /* Живой счётчик — задача проверяет это */
 
     /* Главный цикл ISR: обрабатываем ВСЕ.pending прерывания за один вызов.
      * Если interrupt status == 0 — выходим. Нет timer → нет таймаута,

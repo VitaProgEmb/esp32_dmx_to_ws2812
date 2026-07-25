@@ -14,3 +14,5 @@ void uart_bypass_set_notify_task(int port, TaskHandle_t handle);
 void uart_bypass_set_dir(int port, int level);
 void uart_bypass_set_tx_mode(int port, bool tx_mode);
 bool uart_bypass_get_frame(int port, uint8_t *out, int max_len, uint32_t *frame_len);
+
+extern volatile uint32_t g_isr_tick;

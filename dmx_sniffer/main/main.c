@@ -113,6 +113,7 @@ void app_main(void) {
         .tx_pin  = DMX_GPIO_TX1,
         .dir_pin = -1,
         .uart_num = UART_NUM_1,
+        .fifo_thr = 8,
     });
 
     dmx_rx_init(1, &(dmx_rx_cfg_t){
@@ -120,6 +121,7 @@ void app_main(void) {
         .tx_pin  = DMX_GPIO_TX2,
         .dir_pin = DMX_GPIO_DIR2,
         .uart_num = UART_NUM_2,
+        .fifo_thr = 16,
     });
 
     dmx_rx_start();
