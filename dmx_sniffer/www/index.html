@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DMX Sniffer</title>
+<style>
+/* =====================================================================
+   RESET & BASE
+   ===================================================================== */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;overflow:hidden}
+input,select,button,textarea{font:inherit;color:inherit}
+a{color:#58a6ff;text-decoration:none}
+
+/* =====================================================================
+   LAYOUT
+   ===================================================================== */
+.app{display:flex;flex-direction:column;height:100vh}
+.header{background:#161b22;padding:12px 24px;display:flex;align-items:center;border-bottom:1px solid #30363d;flex-shrink:0;position:relative}
+.header h1{font-size:1.4em;font-weight:700;position:absolute;left:50%;transform:translateX(-50%);white-space:nowrap}
+.header .status{margin-left:auto;font-size:.8em;color:#b0b8c1;display:flex;align-items:center;gap:6px}
+.header .dot{width:8px;height:8px;border-radius:50%;background:#f85149}
+.header .dot.on{background:#3fb950}
+.tabs{display:flex;background:#161b22;border-bottom:1px solid #30363d;flex-shrink:0}
+.tab{flex:1;padding:12px 16px;text-align:center;cursor:pointer;font-size:.9em;font-weight:500;color:#b0b8c1;border-bottom:2px solid transparent;white-space:nowrap;transition:color .15s}
+.tab:hover{color:#e6edf3;background:#1c2128}
+.tab.active{color:#e6edf3;border-bottom-color:#58a6ff;background:#1c2128}
+.panels{flex:1;overflow-y:auto;padding:20px 24px;width:100%;margin:0 auto}
+.panel{display:none}
+.panel.active{display:block}
+
+/* =====================================================================
+   CARDS
+   ===================================================================== */
+.card{background:#161b22;border:2px solid #444c56;border-radius:8px;padding:16px 20px;margin-bottom:12px}
+.card h3{font-size:1.1em;font-weight:700;color:#58a6ff;margin-bottom:14px;text-align:center;justify-content:center}
+.card h3.warn{color:#d29922}
+.card h3.danger{color:#f85149}
+
+/* =====================================================================
+   FORM CONTROLS
+   ===================================================================== */
+.row{display:flex;align-items:center;margin-bottom:12px;gap:12px;flex-wrap:wrap}
+.row:last-child{margin-bottom:0}
+.row label{min-width:140px;font-size:.88em;color:#b0b8c1}
+.row label.wide{min-width:180px}
+.val{min-width:48px;text-align:right;font-weight:600;font-variant-numeric:tabular-nums;color:#e6edf3}
+input[type=range]{flex:1;min-width:150px;accent-color:#58a6ff}
+input[type=number]{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;width:80px;text-align:center;font-size:.9em}
+input[type=number]:focus{border-color:#58a6ff;outline:none}
+select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:.9em;min-width:160px}
+select:focus{border-color:#58a6ff;outline:none}
+input[type=color]{width:40px;height:28px;border:1px solid #30363d;border-radius:4px;padding:1px;cursor:pointer;background:transparent}
+input[type=color]::-webkit-color-swatch-wrapper{padding:0}
+input[type=color]::-webkit-color-swatch{border:none;border-radius:3px}
+
+/* =====================================================================
+   BUTTONS
+   ===================================================================== */
+button{background:#21262d;color:#e6edf3;border:1px solid #30363d;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500;font-size:.9em;transition:background .15s,border-color .15s}
+button:hover{background:#30363d;border-color:#484f58}
+button:active{background:#282e33}
+button.primary{background:#238636;border-color:#2ea043;color:#fff}
+button.primary:hover{background:#2ea043}
+button.danger{background:#da3633;border-color:#f85149;color:#fff}
+button.danger:hover{background:#f85149}
+button.sm{padding:4px 10px;font-size:.8em}
+
+/* =====================================================================
+   TOGGLE SWITCH
+   ===================================================================== */
+.switch{position:relative;width:40px;height:22px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch .track{position:absolute;inset:0;background:#30363d;border-radius:11px;cursor:pointer;transition:background .2s}
+.switch .track::after{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:#c9d1d9;border-radius:50%;transition:transform .2s}
+.switch input:checked+.track{background:#238636}
+.switch input:checked+.track::after{transform:translateX(18px)}
+
+/* =====================================================================
+   MODE BADGE
+   ===================================================================== */
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:.75em;font-weight:600}
+.badge.safe{background:#0d419d33;color:#58a6ff;border:1px solid #1f6feb55}
+.badge.warn{background:#9e6a0333;color:#d29922;border:1px solid #9e6a0355}
+.badge.danger{background:#f8514933;color:#f85149;border:1px solid #f8514955}
+
+/* =====================================================================
+   DMX BAR CHART
+   ===================================================================== */
+.bars-wrap{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;margin-bottom:4px}
+.bars-canvas{width:100%;height:120px;display:block}
+.bars-labels{display:flex;justify-content:space-between;font-size:.65em;color:#7a8599;margin-top:4px}
+
+/* =====================================================================
+   LED PREVIEW STRIP
+   ===================================================================== */
+.led-strip{height:16px;background:#0d1117;border:1px solid #30363d;border-radius:4px;overflow:hidden}
+.led-strip canvas{display:block;width:100%;height:16px}
+
+/* =====================================================================
+   PATCH TABLE
+   ===================================================================== */
+.patch-table{width:100%;border-collapse:collapse;font-size:.85em}
+.patch-table th{text-align:left;padding:6px 8px;color:#8b949e;border-bottom:1px solid #30363d;font-weight:500}
+.patch-table td{padding:6px 8px;border-bottom:1px solid #21262d}
+.patch-table input[type=number]{width:60px}
+.patch-table select{width:auto}
+.patch-table .test-active{background:#23863622}
+.patch-table button{padding:3px 8px}
+
+/* =====================================================================
+   OTA
+   ===================================================================== */
+.ota-bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:8px}
+.ota-bar .fill{height:100%;background:#58a6ff;width:0;transition:width .2s}
+.ota-result{font-size:.85em;font-weight:600;margin-top:6px}
+.ota-result.ok{color:#3fb950}
+.ota-result.err{color:#f85149}
+
+/* =====================================================================
+   HELP TEXT
+   ===================================================================== */
+.help{font-size:.8em;color:#7a8599;line-height:1.6;margin-top:8px}
+
+/* =====================================================================
+   MODAL
+   ===================================================================== */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal-box{background:#161b22;border:2px solid #30363d;border-radius:12px;padding:24px;max-width:400px;width:90%;text-align:center}
+.modal-box h3{font-size:1.1em;font-weight:700;margin-bottom:12px;color:#d29922}
+.modal-box p{font-size:.9em;color:#b0b8c1;line-height:1.5;margin-bottom:20px}
+.modal-btns{display:flex;gap:10px;justify-content:center}
+.modal-btns button{flex:1;padding:10px;border-radius:8px;font-weight:600}
+
+/* =====================================================================
+   ANIMATIONS
+   ===================================================================== */
+@keyframes arrowPulse {
+  0% { transform: translateX(-12px); opacity: 0; }
+  30% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { transform: translateX(8px); opacity: 0; }
+}
+@keyframes arrowPulseOut {
+  0% { transform: translateX(12px); opacity: 0; }
+  30% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { transform: translateX(-8px); opacity: 0; }
+}
+.arrow-anim { animation: arrowPulse 0.7s ease-in-out infinite; }
+.arrow-anim-out { animation: arrowPulseOut 0.7s ease-in-out infinite; }
+
+/* =====================================================================
+   SCROLLBAR
+   ===================================================================== */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#484f58}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- HEADER -->
+  <div class="header">
+    <h1>DMX Sniffer</h1>
+    <div class="status">
+      <div class="dot" id="wifiDot"></div>
+      <span id="modeLabel">Сниффер</span>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs" id="tabs"></div>
+
+  <!-- PANELS -->
+  <div class="panels" id="panels"></div>
+  <!-- MODAL -->
+  <div class="modal-overlay" id="modeModal">
+    <div class="modal-box">
+      <h3 id="modalTitle">Внимание!</h3>
+      <p id="modalText">Вы переходите в режим передачи DMX.</p>
+      <div class="modal-btns">
+        <button onclick="closeModeModal(false)" style="background:#21262d;border:1px solid #30363d;color:#b0b8c1">Отмена</button>
+        <button onclick="closeModeModal(true)" style="background:#238636;border:1px solid #2ea043;color:#fff">Согласен</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* =====================================================================
+   EVENT BUS
+   ===================================================================== */
+const Bus = (() => {
+  const _h = {};
+  return {
+    on(e, fn) { (_h[e] ||= []).push(fn); },
+    off(e, fn) { if (_h[e]) _h[e] = _h[e].filter(f => f !== fn); },
+    emit(e, d) { (_h[e] || []).forEach(fn => fn(d, e)); }
+  };
+})();
+
+/* =====================================================================
+   STORE (реактивное состояние)
+   ===================================================================== */
+const Store = (() => {
+  const _s = {}, _sub = {};
+  return {
+    get(k) { return _s[k]; },
+    set(k, v) {
+      if (_s[k] === v) return;
+      _s[k] = v;
+      (_sub[k] || []).forEach(fn => fn(v, k));
+    },
+    sub(k, fn) { (_sub[k] ||= []).push(fn); },
+    all() { return Object.assign({}, _s); }
+  };
+})();
+
+/* =====================================================================
+   API LAYER
+   ===================================================================== */
+const API = {
+  async get(url) {
+    try {
+      const r = await fetch(url);
+      return r.ok ? await r.json() : null;
+    } catch { return null; }
+  },
+  async post(url, data) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: data instanceof Blob ? {} : { 'Content-Type': 'application/json' },
+        body: data instanceof Blob ? data : JSON.stringify(data)
+      });
+      return r.ok ? await r.json() : null;
+    } catch { return null; }
+  },
+  async getBlob(url) {
+    try {
+      const r = await fetch(url);
+      return r.ok ? await r.arrayBuffer() : null;
+    } catch { return null; }
+  }
+};
+
+/* =====================================================================
+   MOCK DATA (для превью без ESP32)
+   ===================================================================== */
+const MOCK = {
+  dmx0: new Uint8Array(512), dmx1: new Uint8Array(512),
+  fixtures: [[255,0,0],[0,255,0],[0,0,255],[255,255,0]],
+  state: {
+    mode:'sniffer', led_count:100, led_count2:0,
+    reverse:false, shift:0, led_mode:'parallel',
+    interpolate:true, channel_order:0,
+    fallback:{r:0,g:0,b:255}, timeout:100,
+    dmx0:1, dmx1:1, patch_count:4
+  },
+  _t: 0,
+  tick() {
+    this._t += 0.03;
+    for (let i = 0; i < 512; i++) {
+      this.dmx0[i] = Math.max(0, Math.min(255,
+        Math.round(128 + 127 * Math.sin(this._t + i * 0.1))));
+      this.dmx1[i] = Math.max(0, Math.min(255,
+        Math.round(128 + 127 * Math.cos(this._t + i * 0.15))));
+    }
+    this.fixtures = this.fixtures.map((f, i) => [
+      Math.max(0, Math.min(255, Math.round(128 + 127 * Math.sin(this._t + i)))),
+      Math.max(0, Math.min(255, Math.round(128 + 127 * Math.sin(this._t + i + 2)))),
+      Math.max(0, Math.min(255, Math.round(128 + 127 * Math.sin(this._t + i + 4))))
+    ]);
+  }
+};
+
+/* =====================================================================
+   MODULE SYSTEM
+   ===================================================================== */
+const _modules = [];
+const _tabs = [];
+
+function registerModule(mod) {
+  _modules.push(mod);
+  if (mod.tab) {
+    _tabs.push({
+      label: mod.tab.label,
+      id: mod.name,
+      show: mod.tab.show || (() => true),
+      icon: mod.tab.icon || ''
+    });
+  }
+}
+
+/* =====================================================================
+   TAB MANAGER
+   ===================================================================== */
+function initTabs() {
+  const tabsEl = document.getElementById('tabs');
+  const panelsEl = document.getElementById('panels');
+
+  function render() {
+    tabsEl.innerHTML = '';
+    panelsEl.innerHTML = '';
+
+    _tabs.forEach(t => {
+      if (!t.show()) return;
+
+      const tab = document.createElement('div');
+      tab.className = 'tab' + (Store.get('_activeTab') === t.id ? ' active' : '');
+      tab.textContent = t.label;
+      tab.onclick = () => { Store.set('_activeTab', t.id); render(); };
+      tabsEl.appendChild(tab);
+
+      const panel = document.createElement('div');
+      panel.className = 'panel' + (Store.get('_activeTab') === t.id ? ' active' : '');
+      panel.id = 'panel-' + t.id;
+      panelsEl.appendChild(panel);
+    });
+
+    _modules.forEach(m => {
+      if (m.tab && m.panel && Store.get('_activeTab') === m.name) {
+        const el = document.getElementById('panel-' + m.name);
+        if (el) el.innerHTML = m.panel;
+        if (m.mounted) m.mounted();
+      }
+    });
+  }
+
+  Store.sub('_activeTab', render);
+  if (!Store.get('_activeTab') && _tabs.length) {
+    Store.set('_activeTab', _tabs[0].id);
+  }
+  render();
+}
+
+/* =====================================================================
+   DRAW HELPERS
+   ===================================================================== */
+function drawBars(canvas, data, offset, count) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width = canvas.parentElement.clientWidth;
+  const h = canvas.height = 100;
+  const bw = w / count;
+
+  const img = ctx.createImageData(w, h);
+  const d = img.data;
+
+  for (let x = 0; x < count && x + offset < 512; x++) {
+    const v = data[x + offset] || 0;
+    const bh = Math.max(Math.round(v / 255 * h), 1);
+    const cr = Math.round(40 + v * 0.84);
+    const cb = Math.round(v * 0.7);
+    const x0 = Math.floor(x * bw);
+    const x1 = Math.floor((x + 1) * bw);
+
+    for (let px = x0; px < x1; px++) {
+      for (let y = h - bh; y < h; y++) {
+        const p = (y * w + px) * 4;
+        d[p] = cr; d[p+1] = cr; d[p+2] = cb; d[p+3] = 255;
+      }
+      for (let y = 0; y < h - bh; y++) {
+        const p = (y * w + px) * 4;
+        d[p] = 13; d[p+1] = 17; d[p+2] = 23; d[p+3] = 255;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function drawLedStrip(canvas, colors) {
+  if (!canvas || !colors.length) return;
+  const n = colors.length;
+  canvas.width = Math.max(n, 1);
+  canvas.height = 12;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(n, 1);
+  const d = img.data;
+  for (let i = 0; i < n; i++) {
+    const p = i * 4;
+    d[p] = colors[i][0]; d[p+1] = colors[i][1]; d[p+2] = colors[i][2]; d[p+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+/* =====================================================================
+   MODULE: SETTINGS
+   ===================================================================== */
+registerModule({
+  name: 'settings',
+  tab: { label: 'Настройки', icon: '⚙' },
+  panel: `
+    <div class="card">
+      <h3>DMX сигнал</h3>
+      <div style="display:flex;gap:12px">
+        <div id="dmxBox0" style="flex:1;background:transparent;border:2px solid #30363d;border-radius:8px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;transition:border-color .2s;overflow:hidden;position:relative">
+          <div style="position:relative;z-index:1"><div style="font-weight:700;font-size:1em;margin-bottom:4px">DMX PORT 1</div><div id="dmxLabel0" style="font-size:.85em;color:#e6edf3">нет сигнала</div></div>
+          <div style="display:flex;align-items:center;gap:2px;position:relative;z-index:1">
+            <svg id="dmxArrow0" width="30" height="20" viewBox="0 0 30 20" fill="none" style="opacity:0;transition:opacity .3s">
+              <path d="M2 10 L22 10 M16 4 L24 10 L16 16" stroke="#3fb950" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg id="dmxIcon0" width="38" height="38" viewBox="0 0 38 38" fill="none" stroke-width="1.5" style="flex-shrink:0">
+              <circle cx="19" cy="19" r="15" stroke="#7a8599"/>
+              <circle cx="19" cy="19" r="12" stroke="#7a8599"/>
+              <circle id="dmxPin0a" cx="19" cy="12" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <circle id="dmxPin0b" cx="13" cy="23" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <circle id="dmxPin0c" cx="25" cy="23" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <line x1="19" y1="4" x2="19" y2="7" stroke="#7a8599" stroke-width="2"/>
+            </svg>
+          </div>
+        </div>
+        <div id="dmxBox1" style="flex:1;background:transparent;border:2px solid #30363d;border-radius:8px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;transition:border-color .2s;overflow:hidden;position:relative">
+          <div style="position:relative;z-index:1"><div style="font-weight:700;font-size:1em;margin-bottom:4px">DMX PORT 2</div><div id="dmxLabel1" style="font-size:.85em;color:#e6edf3">нет сигнала</div></div>
+          <div style="display:flex;align-items:center;gap:2px;position:relative;z-index:1">
+            <svg id="dmxArrow1" width="30" height="20" viewBox="0 0 30 20" fill="none" style="opacity:0;transition:opacity .3s">
+              <path d="M2 10 L22 10 M16 4 L24 10 L16 16" stroke="#3fb950" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg id="dmxIcon1" width="38" height="38" viewBox="0 0 38 38" fill="none" stroke-width="1.5" style="flex-shrink:0">
+              <circle cx="19" cy="19" r="15" stroke="#7a8599"/>
+              <circle cx="19" cy="19" r="12" stroke="#7a8599"/>
+              <circle id="dmxPin1a" cx="19" cy="12" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <circle id="dmxPin1b" cx="13" cy="23" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <circle id="dmxPin1c" cx="25" cy="23" r="2.5" stroke="#7a8599" fill="#0d1117"/>
+              <line x1="19" y1="4" x2="19" y2="7" stroke="#7a8599" stroke-width="2"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="help" style="padding:8px 16px;margin:0 0 4px 0;font-size:.85em">Трансляция — приём DMX → WS2812. LED Test — прямое управление лентой. DMX Test — генерация. Patch — настройка приборов.</div>
+
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="display:flex;border-bottom:1px solid #30363d">
+        <button id="modeTab0" onclick="ModuleAPI.setMode('sniffer')" style="flex:1;padding:12px 8px;background:transparent;border:none;border-bottom:3px solid transparent;cursor:pointer;transition:all .15s;text-align:center">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:0 auto 4px"><polygon points="6,3 20,12 6,21"/></svg>
+          <div style="font-size:.95em;font-weight:600;color:#b0b8c1">Трансляция</div>
+        </button>
+        <button id="modeTab2" onclick="ModuleAPI.setMode('led_test')" style="flex:1;padding:12px 8px;background:transparent;border:none;border-bottom:3px solid transparent;cursor:pointer;transition:all .15s;text-align:center">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:0 auto 4px"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>
+          <div style="font-size:.95em;font-weight:600;color:#b0b8c1">LED Test</div>
+        </button>
+        <div style="width:1px;background:#30363d;flex-shrink:0"></div>
+        <button id="modeTab1" onclick="ModuleAPI.setMode('tester')" style="flex:1;padding:12px 8px;background:transparent;border:none;border-bottom:3px solid transparent;cursor:pointer;transition:all .15s;text-align:center">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:0 auto 4px"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15 4.5L9 10l3 3 5.5-5.5a2.12 2.12 0 0 0-3-3z"/><path d="M9 10L4.5 14.5a2.12 2.12 0 0 0 3 3L12 13"/></svg>
+          <div style="font-size:.95em;font-weight:600;color:#b0b8c1">DMX Test</div>
+        </button>
+        <button id="modeTab3" onclick="ModuleAPI.setMode('patch')" style="flex:1;padding:12px 8px;background:transparent;border:none;border-bottom:3px solid transparent;cursor:pointer;transition:all .15s;text-align:center">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:0 auto 4px"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          <div style="font-size:.95em;font-weight:600;color:#b0b8c1">Patch</div>
+        </button>
+      </div>
+    </div>
+
+    <!-- === INLINE PANELS === -->
+    <div id="inlineDmxTest" style="display:none;border:2px solid #d29922;padding:10px;margin-bottom:4px;border-radius:8px">
+      <div class="card">
+        <h3 class="warn">DMX Генератор</h3>
+        <div class="row"><label>Линия:</label><select id="txPort"><option value="0">Линия 1 (GPIO2)</option><option value="1">Линия 2 (GPIO17)</option><option value="2">Обе</option></select></div>
+        <div class="row"><label>Адресация:</label><label style="font-size:.85em;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="txAddr" value="ch" checked> По каналу</label><label style="font-size:.85em;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="txAddr" value="px"> По пикселю</label></div>
+        <div class="row"><label id="txAddrLabel">Канал:</label><input type="range" id="txCh" min="1" max="512" value="1"><span class="val" id="txChVal">1</span></div>
+        <div class="row"><label>Режим:</label><label style="font-size:.85em;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="txMode" value="point" checked> Точка</label><label style="font-size:.85em;display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="txMode" value="fill"> Заливка</label></div>
+        <div class="row" id="txCountRow" style="display:none"><label>Кол-во:</label><input type="range" id="txCount" min="1" max="512" value="3"><span class="val" id="txCountVal">3</span></div>
+      </div>
+      <div class="card">
+        <h3 class="warn">Цвет DMX</h3>
+        <div class="row"><label>Цвет:</label><input type="color" id="txColor" value="#ff0000"></div>
+        <div class="row"><label style="color:#f85149">R:</label><input type="range" id="txR" min="0" max="255" value="255" style="accent-color:#f85149"><span class="val" id="txRVal" style="color:#f85149">255</span></div>
+        <div class="row"><label style="color:#3fb950">G:</label><input type="range" id="txG" min="0" max="255" value="0" style="accent-color:#3fb950"><span class="val" id="txGVal" style="color:#3fb950">0</span></div>
+        <div class="row"><label style="color:#58a6ff">B:</label><input type="range" id="txB" min="0" max="255" value="0" style="accent-color:#58a6ff"><span class="val" id="txBVal" style="color:#58a6ff">0</span></div>
+        <div id="txPreview" style="height:20px;border-radius:4px;background:#f00;margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div id="inlineLedTest" style="display:none;border:2px solid #f85149;padding:10px;margin-bottom:4px;border-radius:8px">
+      <div class="card">
+        <h3 class="warn">WS2812 Тест</h3>
+        <div class="row"><label>LED номер:</label><input type="range" id="wsPx" min="0" max="999" value="0"><span class="val" id="wsPxVal">0</span></div>
+        <div class="row"><label>Режим:</label>
+          <select id="wsMode" style="flex:1">
+            <option value="point">Точка</option>
+            <option value="fill">Заливка</option>
+            <option value="rainbow">Радуга</option>
+            <option value="running">Бегущий свет</option>
+            <option value="breathe">Дыхание</option>
+            <option value="wave">Цветная волна</option>
+            <option value="clear">Выключить</option>
+          </select>
+        </div>
+        <div class="row" id="wsCountRow" style="display:none"><label>Кол-во:</label><input type="range" id="wsCount" min="1" max="1000" value="10"><span class="val" id="wsCountVal">10</span></div>
+        <div class="row" id="wsSpeedRow" style="display:none"><label>Скорость:</label><input type="range" id="wsSpeed" min="5" max="200" value="30"><span class="val" id="wsSpeedVal">30</span></div>
+      </div>
+      <div class="card" id="wsColorCard">
+        <h3 class="warn">Цвет WS2812</h3>
+        <div class="row"><label>Цвет:</label><input type="color" id="wsColor" value="#ff0000"></div>
+        <div class="row"><label style="color:#f85149">R:</label><input type="range" id="wsR" min="0" max="255" value="255" style="accent-color:#f85149"><span class="val" id="wsRVal" style="color:#f85149">255</span></div>
+        <div class="row"><label style="color:#3fb950">G:</label><input type="range" id="wsG" min="0" max="255" value="0" style="accent-color:#3fb950"><span class="val" id="wsGVal" style="color:#3fb950">0</span></div>
+        <div class="row"><label style="color:#58a6ff">B:</label><input type="range" id="wsB" min="0" max="255" value="0" style="accent-color:#58a6ff"><span class="val" id="wsBVal" style="color:#58a6ff">0</span></div>
+        <div id="wsPreview" style="height:20px;border-radius:4px;background:#f00;margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div id="inlinePatch" style="display:none;border:2px solid #a371f7;padding:10px;margin-bottom:4px;border-radius:8px">
+      <div class="card" style="text-align:center;width:100%">
+        <h3>Тест прибора</h3>
+        <div class="row" style="justify-content:center"><label>DMX Порт:</label><select id="patchPort"><option value="0">Порт 1</option><option value="1">Порт 2</option></select></div>
+        <div class="row" style="justify-content:center;gap:8px">
+          <button onclick="ModuleAPI.patchNav(-1)" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:10px 20px;cursor:pointer;font-size:1.5em;font-weight:700">◀</button>
+          <input type="number" id="patchTestNum" value="1" min="1" max="170" style="width:70px;font-size:1.2em">
+          <button onclick="ModuleAPI.patchNav(1)" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:10px 20px;cursor:pointer;font-size:1.5em;font-weight:700">▶</button>
+        </div>
+        <div class="row" style="justify-content:center;gap:8px">
+          <button onclick="ModuleAPI.patchAddCurrent()">+ В патч</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Добавить группу</h3>
+        <div class="row"><label>DMX Порт:</label><select id="patchPortGroup"><option value="0">Порт 1</option><option value="1">Порт 2</option></select></div>
+        <div class="row"><label>Приборов:</label><input type="number" id="patchCountAdd" value="100" min="1" max="170"></div>
+        <div class="row"><label>С адреса:</label><input type="number" id="patchAddrStart" value="1" min="1" max="512"></div>
+        <div class="row"><button class="primary" onclick="ModuleAPI.patchAddGroup()">+ Добавить</button></div>
+      </div>
+      <div class="card">
+        <h3>Удалить группу</h3>
+        <div class="row"><label>Прибор с:</label><input type="number" id="patchDelFrom" value="1" min="1" max="170"></div>
+        <div class="row"><label>по:</label><input type="number" id="patchDelTo" value="100" min="1" max="170"></div>
+        <div class="row"><button class="danger" onclick="ModuleAPI.patchDelGroup()">Удалить</button></div>
+      </div>
+      <div class="card">
+        <h3>Таблица патчей (<span id="patchTotal">0</span>)</h3>
+        <div style="max-height:300px;overflow-y:auto">
+          <table class="patch-table" id="patchTable">
+            <thead><tr><th>#</th><th>Порт</th><th>Адрес DMX</th><th></th></tr></thead>
+            <tbody id="patchBody"></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" onclick="ModuleAPI.patchSave()">Сохранить</button>
+          <button onclick="ModuleAPI.patchLoad()">Загрузить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- === SNIFFER-ONLY SETTINGS === -->
+    <div id="snifferSettings" style="border:2px solid #58a6ff;padding:10px;margin-bottom:4px;border-radius:8px">
+      <div class="card">
+        <h3>LED лента</h3>
+        <div class="row"><label class="wide">Strip 1 (GPIO23):</label><input type="number" id="ledCount1" value="100" min="1" max="1000"><button class="sm primary" onclick="ModuleAPI.setLeds(0)">OK</button></div>
+        <div class="row"><label class="wide">Strip 2 (GPIO5):</label><input type="number" id="ledCount2" value="0" min="0" max="1000"><button class="sm primary" onclick="ModuleAPI.setLeds(1)">OK</button></div>
+        <div class="row"><label>Режим лент:</label><select id="ledMode"><option value="parallel">Параллельно</option><option value="sequential">Последовательно</option></select></div>
+        <div class="row"><label>Реверс:</label><label class="switch"><input type="checkbox" id="ledReverse"><span class="track"></span></label></div>
+        <div class="row"><label>Интерполяция:</label><label class="switch"><input type="checkbox" id="ledInterpolate" checked><span class="track"></span></label></div>
+        <div class="row"><label>Сдвиг:</label><input type="range" id="ledShift" min="0" max="999" value="0"><span class="val" id="ledShiftVal">0</span></div>
+      </div>
+
+      <div class="card">
+        <h3>Порядок RGB</h3>
+        <div class="row"><label>Порядок:</label><select id="chOrder"><option value="0">RGB</option><option value="1">RBG</option><option value="2">GRB</option><option value="3">GBR</option><option value="4">BRG</option><option value="5">BGR</option></select></div>
+      </div>
+
+      <div class="card">
+        <h3>Fallback (нет DMX)</h3>
+        <div class="row"><label>Цвет:</label><input type="color" id="fbColor" value="#0000ff"></div>
+        <div class="row"><label>Таймаут:</label><input type="number" id="fbTimeout" value="100" min="10" max="5000"><span style="font-size:.85em;color:#8b949e">мс</span></div>
+        <div class="help">Когда нет DMX сигнала дольше таймаута — все WS2812 показывают этот цвет.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Система</h3>
+      <div class="row"><button class="primary" onclick="ModuleAPI.save()">Сохранить в NVS</button><button onclick="ModuleAPI.reboot()">Перезагрузка</button></div>
+      <div class="row" style="margin-top:8px"><input type="file" id="otaFile" accept=".bin" style="display:none"><button onclick="document.getElementById('otaFile').click()">Обновление ПО (OTA)</button></div>
+      <div class="ota-bar"><div class="fill" id="otaFill"></div></div>
+      <div class="ota-result" id="otaResult"></div>
+    </div>
+  `,
+  mounted() {
+    const $ = id => document.getElementById(id);
+    $('ledMode').onchange = e => ModuleAPI.setLedConfig({ mode: e.target.value });
+    $('ledReverse').onchange = e => ModuleAPI.setLedConfig({ reverse: e.target.checked });
+    $('ledInterpolate').onchange = e => ModuleAPI.setLedConfig({ interpolate: e.target.checked });
+    $('ledShift').oninput = e => { $('ledShiftVal').textContent = e.target.value; ModuleAPI.setLedConfig({ shift: +e.target.value }); };
+    $('chOrder').onchange = e => ModuleAPI.setFixture({ channel_order: +e.target.value });
+    $('fbColor').onchange = e => {
+      const hex = e.target.value;
+      ModuleAPI.setFixture({ fallback: { r: parseInt(hex.slice(1,3),16), g: parseInt(hex.slice(3,5),16), b: parseInt(hex.slice(5,7),16) }});
+    };
+    $('fbTimeout').onchange = e => ModuleAPI.setFixture({ timeout: +e.target.value });
+    $('otaFile').onchange = e => { if (e.target.files[0]) ModuleAPI.ota(e.target.files[0]); };
+
+    ['patchTestNum','patchCountAdd','patchDelFrom','patchDelTo'].forEach(id => {
+      const el = $(id);
+      if (el) el.oninput = () => { el.value = Math.min(170, Math.max(1, +el.value || 1)); };
+    });
+
+    Store.sub('mode', v => {
+      const modes = ['sniffer','tester','led_test','patch'];
+      const colors = ['#58a6ff','#d29922','#f85149','#a371f7'];
+      modes.forEach((m, i) => {
+        const tab = document.getElementById('modeTab'+i);
+        if (!tab) return;
+        const active = v === m;
+        tab.style.borderBottomColor = active ? colors[i] : 'transparent';
+        tab.style.background = active ? colors[i]+'0a' : 'transparent';
+        const label = tab.querySelector('div:last-child');
+        if (label) label.style.color = active ? colors[i] : '#b0b8c1';
+      });
+      // Show/hide inline panels
+      const ie = id => document.getElementById(id);
+      const dmxT = ie('inlineDmxTest'), ledT = ie('inlineLedTest'), pat = ie('inlinePatch'), snS = ie('snifferSettings');
+      if (dmxT) dmxT.style.display = v === 'tester' ? '' : 'none';
+      if (ledT) ledT.style.display = v === 'led_test' ? '' : 'none';
+      if (pat) pat.style.display = v === 'patch' ? '' : 'none';
+      if (snS) snS.style.display = v === 'sniffer' ? '' : 'none';
+      // Red arrow for tester/patch
+      const isOut = (v === 'tester' || v === 'patch');
+      const PATH_RIGHT = 'M2 10 L22 10 M16 4 L24 10 L16 16';
+      const PATH_LEFT  = 'M28 10 L8 10 M14 4 L6 10 L14 16';
+      [0,1].forEach(p => {
+        const arrow = ie('dmxArrow'+p);
+        if (!arrow) return;
+        const path = arrow.querySelector('path');
+        if (isOut) {
+          arrow.style.opacity = '1';
+          arrow.classList.remove('arrow-anim');
+          arrow.classList.add('arrow-anim-out');
+          if (path) { path.setAttribute('stroke', '#f85149'); path.setAttribute('d', PATH_LEFT); }
+        } else {
+          arrow.style.opacity = Store.get('dmx'+p) ? '1' : '0';
+          arrow.classList.remove('arrow-anim-out');
+          arrow.classList.add('arrow-anim');
+          if (path) { path.setAttribute('stroke', '#3fb950'); path.setAttribute('d', PATH_RIGHT); }
+        }
+      });
+      Bus.emit('dmx:data', { p0: Store.get('_lastDmx0') || new Uint8Array(512), p1: Store.get('_lastDmx1') || new Uint8Array(512) });
+    });
+    // Trigger initial mode render
+    { const m = Store.get('mode') || 'sniffer';
+      const modes = ['sniffer','tester','led_test','patch'];
+      const colors = ['#58a6ff','#d29922','#f85149','#a371f7'];
+      modes.forEach((mm, i) => {
+        const tab = document.getElementById('modeTab'+i);
+        if (!tab) return;
+        const active = m === mm;
+        tab.style.borderBottomColor = active ? colors[i] : 'transparent';
+        tab.style.background = active ? colors[i]+'0a' : 'transparent';
+        const label = tab.querySelector('div:last-child');
+        if (label) label.style.color = active ? colors[i] : '#b0b8c1';
+      });
+      const ie = id => document.getElementById(id);
+      if (ie('inlineDmxTest')) ie('inlineDmxTest').style.display = m === 'tester' ? '' : 'none';
+      if (ie('inlineLedTest')) ie('inlineLedTest').style.display = m === 'led_test' ? '' : 'none';
+      if (ie('inlinePatch')) ie('inlinePatch').style.display = m === 'patch' ? '' : 'none';
+      if (ie('snifferSettings')) ie('snifferSettings').style.display = m === 'sniffer' ? '' : 'none';
+      const isOutInit = (m === 'tester' || m === 'patch');
+      const PATH_RIGHT = 'M2 10 L22 10 M16 4 L24 10 L16 16';
+      const PATH_LEFT  = 'M28 10 L8 10 M14 4 L6 10 L14 16';
+      [0,1].forEach(p => {
+        const arrow = ie('dmxArrow'+p);
+        if (!arrow) return;
+        const path = arrow.querySelector('path');
+        if (isOutInit) {
+          arrow.style.opacity = '1';
+          arrow.classList.remove('arrow-anim');
+          arrow.classList.add('arrow-anim-out');
+          if (path) { path.setAttribute('stroke', '#f85149'); path.setAttribute('d', PATH_LEFT); }
+        } else {
+          arrow.style.opacity = '0';
+          arrow.classList.remove('arrow-anim-out');
+          arrow.classList.add('arrow-anim');
+          if (path) { path.setAttribute('stroke', '#3fb950'); path.setAttribute('d', PATH_RIGHT); }
+        }
+      });
+    }
+    // Initial render
+    Store.sub('led_mode', v => { if ($('ledMode')) $('ledMode').value = v; });
+    Store.sub('reverse', v => { if ($('ledReverse')) $('ledReverse').checked = v; });
+    Store.sub('interpolate', v => { if ($('ledInterpolate')) $('ledInterpolate').checked = v; });
+    Store.sub('shift', v => { if ($('ledShift')) { $('ledShift').value = v; $('ledShiftVal').textContent = v; }});
+    Store.sub('dmx0', v => {
+      const box = document.getElementById('dmxBox0');
+      const lbl = document.getElementById('dmxLabel0');
+      if (!box) return;
+      lbl.textContent = v ? 'есть сигнал' : 'нет сигнала';
+    });
+    Store.sub('dmx1', v => {
+      const box = document.getElementById('dmxBox1');
+      const lbl = document.getElementById('dmxLabel1');
+      if (!box) return;
+      lbl.textContent = v ? 'есть сигнал' : 'нет сигнала';
+    });
+    // Arrow + XLR colors handled only by mode subscriber below
+  }
+});
+
+/* =====================================================================
+   MODULE: DMX TESTER (inline — UI in settings panel)
+   ===================================================================== */
+registerModule({
+  name: 'tester',
+  init() {
+    const $ = id => document.getElementById(id);
+    function sync() {
+      const m = document.querySelector('input[name=txMode]:checked')?.value || 'point';
+      const cr = document.getElementById('txCountRow'); if (cr) cr.style.display = m === 'fill' ? '' : 'none';
+      const r = +$('txR')?.value, g = +$('txG')?.value, b = +$('txB')?.value;
+      const pv = $('txPreview'); if (pv) pv.style.background = `rgb(${r},${g},${b})`;
+      const isPx = document.querySelector('input[name=txAddr]:checked')?.value === 'px';
+      const al = $('txAddrLabel'); if (al) al.textContent = isPx ? 'Пиксель:' : 'Канал:';
+      const addr = isPx ? (+$('txCh')?.value - 1) * 3 + 1 : +$('txCh')?.value;
+      ModuleAPI.dmxTest({ port: +$('txPort')?.value, channel: Math.min(addr,512), r, g, b, mode:m, count: +$('txCount')?.value });
+    }
+    ['txPort','txR','txG','txB','txCh','txCount'].forEach(id => { const el = $(id); if(el) el.oninput = sync; });
+    const tc = $('txColor'); if(tc) tc.oninput = e => { const h=e.target.value; $('txR').value=parseInt(h.slice(1,3),16); $('txG').value=parseInt(h.slice(3,5),16); $('txB').value=parseInt(h.slice(5,7),16); sync(); };
+    document.querySelectorAll('input[name=txAddr],input[name=txMode]').forEach(el => el.onchange = sync);
+  }
+});
+
+/* =====================================================================
+   MODULE: WS2812 TEST (inline — UI in settings panel)
+   ===================================================================== */
+registerModule({
+  name: 'ws2812',
+  init() {
+    const $ = id => document.getElementById(id);
+    function sync() {
+      const m = $('wsMode')?.value || 'point';
+      const showCount = m === 'fill' || m === 'running' || m === 'wave';
+      const showSpeed = m === 'rainbow' || m === 'running' || m === 'breathe' || m === 'wave';
+      const showColor = m === 'point' || m === 'fill' || m === 'running' || m === 'breathe';
+      const cr = $('wsCountRow'); if (cr) cr.style.display = showCount ? '' : 'none';
+      const sr = $('wsSpeedRow'); if (sr) sr.style.display = showSpeed ? '' : 'none';
+      const cc = $('wsColorCard'); if (cc) cc.style.display = showColor ? '' : 'none';
+      const r = +$('wsR')?.value, g = +$('wsG')?.value, b = +$('wsB')?.value;
+      const pv = $('wsPreview'); if (pv) pv.style.background = `rgb(${r},${g},${b})`;
+      API.post('/api/led_test', { pixel: +$('wsPx')?.value, r, g, b, mode:m, count: +$('wsCount')?.value, speed: +$('wsSpeed')?.value });
+    }
+    ['wsPx','wsR','wsG','wsB','wsCount','wsSpeed'].forEach(id => { const el = $(id); if(el) el.oninput = sync; });
+    const sv = $('wsSpeed'); if(sv) sv.oninput = () => { $('wsSpeedVal').textContent = sv.value; sync(); };
+    const wc = $('wsColor'); if(wc) wc.oninput = e => { const h=e.target.value; $('wsR').value=parseInt(h.slice(1,3),16); $('wsG').value=parseInt(h.slice(3,5),16); $('wsB').value=parseInt(h.slice(5,7),16); sync(); };
+    $('wsMode').onchange = sync;
+  }
+});
+
+/* =====================================================================
+   MODULE: INFO (realtime DMX)
+   ===================================================================== */
+registerModule({
+  name: 'info',
+  tab: { label: 'Инфо', icon: '📊' },
+  panel: `
+    <div class="card">
+      <h3>DMX (порт 1)</h3>
+      <div class="bars-wrap"><canvas class="bars-canvas" id="bar0a"></canvas></div>
+      <div class="bars-labels"><span>1</span><span>64</span><span>128</span><span>192</span><span>255</span></div>
+      <div class="bars-wrap"><canvas class="bars-canvas" id="bar0b"></canvas></div>
+      <div class="bars-labels"><span>256</span><span>320</span><span>384</span><span>448</span><span>512</span></div>
+    </div>
+    <div class="card">
+      <h3>DMX (порт 2)</h3>
+      <div class="bars-wrap"><canvas class="bars-canvas" id="bar1a"></canvas></div>
+      <div class="bars-labels"><span>1</span><span>64</span><span>128</span><span>192</span><span>255</span></div>
+      <div class="bars-wrap"><canvas class="bars-canvas" id="bar1b"></canvas></div>
+      <div class="bars-labels"><span>256</span><span>320</span><span>384</span><span>448</span><span>512</span></div>
+    </div>
+    <div class="card">
+      <h3>LED output</h3>
+      <div class="led-strip"><canvas id="ledCanvas"></canvas></div>
+    </div>
+  `,
+  mounted() {
+    Bus.on('dmx:data', d => {
+      drawBars(document.getElementById('bar0a'), d.p0, 0, 255);
+      drawBars(document.getElementById('bar0b'), d.p0, 255, 257);
+      drawBars(document.getElementById('bar1a'), d.p1, 0, 255);
+      drawBars(document.getElementById('bar1b'), d.p1, 255, 257);
+    });
+    Bus.on('fixture:colors', c => {
+      const canvas = document.getElementById('ledCanvas');
+      drawLedStrip(canvas, c);
+    });
+  }
+});
+
+/* =====================================================================
+   MODULE: PATCH (inline — UI in settings panel)
+   ===================================================================== */
+registerModule({
+  name: 'patch',
+  init() {}
+});
+
+/* =====================================================================
+   MODE MODAL
+   ===================================================================== */
+let _pendingMode = null;
+let _modalCallback = null;
+
+const modeWarnings = {
+  tester: {
+    title: '⚠️ Режим передачи DMX',
+    text: 'Вы переходите в режим <b>генерации DMX сигнала</b>.<br><br>Отключите контроллер от шины DMX перед продолжением!'
+  },
+  patch: {
+    title: '⚠️ Режим Патч',
+    text: 'Вы переходите в режим <b>сканирования и настройки приборов</b>.<br><br>Убедитесь, что DMX кабели подключены правильно.'
+  },
+  led_test: {
+    title: '⚠️ Тест LED ленты',
+    text: 'Вы переходите в режим <b>прямого управления WS2812</b>.<br><br>Лента будет реагировать на команды из интерфейса.'
+  }
+};
+
+function showModeModal(mode) {
+  const w = modeWarnings[mode];
+  if (!w) { ModuleAPI._setMode(mode); return; }
+  _pendingMode = mode;
+  document.getElementById('modalTitle').textContent = w.title;
+  document.getElementById('modalText').innerHTML = w.text;
+  document.getElementById('modeModal').classList.add('open');
+}
+
+function closeModeModal(confirmed) {
+  document.getElementById('modeModal').classList.remove('open');
+  if (confirmed && _pendingMode) {
+    ModuleAPI._setMode(_pendingMode);
+  }
+  _pendingMode = null;
+}
+
+/* =====================================================================
+   MODULE API (вызывается из HTML onclick)
+   ===================================================================== */
+const ModuleAPI = {
+  async setMode(mode) {
+    showModeModal(mode);
+  },
+  async _setMode(mode) {
+    await API.post('/api/mode', { mode });
+    initTabs();
+    Store.set('mode', mode);
+  },
+  async setLeds(strip) {
+    const count = strip === 0
+      ? +(document.getElementById('ledCount1')?.value || 100)
+      : +(document.getElementById('ledCount2')?.value || 0);
+    await API.post('/api/leds', { strip, count });
+    Store.set(strip === 0 ? 'led_count' : 'led_count2', count);
+  },
+  async setLedConfig(cfg) {
+    if (cfg.reverse !== undefined) Store.set('reverse', cfg.reverse);
+    if (cfg.shift !== undefined) Store.set('shift', cfg.shift);
+    if (cfg.mode) Store.set('led_mode', cfg.mode);
+    if (cfg.interpolate !== undefined) Store.set('interpolate', cfg.interpolate);
+    await API.post('/api/led_config', cfg);
+  },
+  async setFixture(cfg) {
+    await API.post('/api/fixture', cfg);
+  },
+  async dmxTest(cfg) {
+    await API.post('/api/dmx_test', cfg);
+  },
+  async save() {
+    await API.post('/api/save');
+    const el = document.getElementById('otaResult');
+    if (el) { el.textContent = 'Сохранено!'; el.className = 'ota-result ok'; setTimeout(() => el.textContent = '', 2000); }
+  },
+  async reboot() { await API.post('/api/reboot'); },
+  async ota(file) {
+    const fill = document.getElementById('otaFill');
+    const result = document.getElementById('otaResult');
+    result.textContent = 'Загрузка...'; result.className = 'ota-result';
+    fill.style.width = '0%';
+    const xhr = new XMLHttpRequest();
+    xhr.upload.onprogress = e => { if (e.lengthComputable) fill.style.width = Math.round(e.loaded/e.total*100) + '%'; };
+    xhr.onload = () => {
+      try {
+        const j = JSON.parse(xhr.responseText);
+        if (j.ok) { result.textContent = 'OK, перезагрузка...'; result.className = 'ota-result ok'; setTimeout(() => location.reload(), 2000); }
+        else { result.textContent = 'Ошибка: ' + (j.error || '?'); result.className = 'ota-result err'; }
+      } catch { result.textContent = 'Ошибка HTTP'; result.className = 'ota-result err'; }
+    };
+    xhr.onerror = () => { result.textContent = 'Ошибка сети'; result.className = 'ota-result err'; };
+    xhr.open('POST', '/api/ota');
+    xhr.send(file);
+  },
+  patchData: [],
+  patchRenderTable() {
+    const body = document.getElementById('patchBody');
+    const total = document.getElementById('patchTotal');
+    if (!body) return;
+    body.innerHTML = '';
+    this.patchData.forEach((e, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i+1}</td><td>Порт ${e.port+1}</td><td>${e.addr}</td><td><button onclick="ModuleAPI.patchDelOne(${i})" style="color:#f85149;background:none;border:none;cursor:pointer">✕</button></td>`;
+      body.appendChild(tr);
+    });
+    if (total) total.textContent = this.patchData.length;
+  },
+  patchAddrForFixture(port, num) {
+    let n = 0;
+    for (const e of this.patchData) { if (e.port === port) n++; if (n === num) return e.addr; }
+    return 0;
+  },
+  patchAddGroup() {
+    const port = +(document.getElementById('patchPortGroup')?.value || 0);
+    const count = +(document.getElementById('patchCountAdd')?.value || 1);
+    const startAddr = +(document.getElementById('patchAddrStart')?.value || 1);
+    for (let i = 0; i < count; i++) {
+      this.patchData.push({ port, addr: startAddr + i * 3 });
+    }
+    this.patchRenderTable();
+  },
+  patchDelGroup() {
+    const from = +(document.getElementById('patchDelFrom')?.value || 1);
+    const to = +(document.getElementById('patchDelTo')?.value || 1);
+    this.patchData = this.patchData.filter((_, i) => i < from - 1 || i >= to);
+    this.patchRenderTable();
+  },
+  patchDelOne(idx) {
+    this.patchData.splice(idx, 1);
+    this.patchRenderTable();
+  },
+  patchNav(dir) {
+    const el = document.getElementById('patchTestNum');
+    if (!el) return;
+    el.value = Math.min(170, Math.max(1, +(el.value || 1) + dir));
+  },
+  async patchTest() {
+    const num = +(document.getElementById('patchTestNum')?.value || 1);
+    const entry = this.patchData[num - 1];
+    if (!entry) return;
+    await API.post('/api/dmx_test', { port: entry.port, channel: entry.addr, r: 255, g: 255, b: 255, mode: 'point', count: 3 });
+  },
+  patchAddCurrent() {
+    const el = document.getElementById('patchTestNum');
+    const num = +(el?.value || 1);
+    const port = +(document.getElementById('patchPort')?.value || 0);
+    const startAddr = +(document.getElementById('patchAddrStart')?.value || 1);
+    const exists = this.patchData.find(e => e.port === port && e.addr === startAddr + (num - 1) * 3);
+    if (!exists) {
+      this.patchData.push({ port, addr: startAddr + (num - 1) * 3 });
+      this.patchRenderTable();
+    }
+    if (el) el.value = Math.min(170, num + 1);
+  },
+  async patchSave() {
+    const csv = this.patchData.map(e => `${e.port},${e.addr}`).join('\n');
+    await API.post('/api/patch', { csv });
+  },
+  async patchLoad() {
+    const r = await fetch('/api/patch');
+    const text = await r.text();
+    this.patchData = text.trim().split('\n').filter(l => l).map(l => {
+      const [port, addr] = l.split(',').map(Number);
+      return { port, addr };
+    });
+    this.patchRenderTable();
+  },
+};
+
+/* =====================================================================
+   POLLING / SSE (mock для превью)
+   ===================================================================== */
+function startPolling() {
+  setInterval(() => {
+    MOCK.tick();
+    Store.set('_lastDmx0', MOCK.dmx0);
+    Store.set('_lastDmx1', MOCK.dmx1);
+    Bus.emit('dmx:data', { p0: MOCK.dmx0, p1: MOCK.dmx1 });
+    Bus.emit('fixture:colors', MOCK.fixtures);
+    Store.set('dmx0', 1);
+    Store.set('dmx1', 1);
+  }, 50);
+}
+
+/* =====================================================================
+   INIT
+   ===================================================================== */
+Store.set('mode', 'sniffer');
+Store.set('led_count', 100);
+Store.set('led_count2', 0);
+Store.set('reverse', false);
+Store.set('shift', 0);
+Store.set('led_mode', 'parallel');
+Store.set('interpolate', true);
+
+initTabs();
+startPolling();
+</script>
+</body>
+</html>

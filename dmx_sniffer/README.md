@@ -1,73 +1,178 @@
-# ESP32 DMX Sniffer & Tester (ТЗ и описание проекта)
+# ESP32 DMX Sniffer & Tester
 
-Данный проект представляет собой специализированное устройство на базе микроконтроллера **ESP32** под управлением **ESP-IDF v5.x**, предназначенное для мониторинга (сниффинга) и генерации (тестирования) сигналов протокола **DMX512**, а также для трансляции DMX-сигналов на адресные светодиодные ленты типа **WS2812**.
+## Архитектура модулей
+
+```
+                              ┌──────────────────┐
+                              │     main.c       │
+                              │  только init     │
+                              └────────┬─────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+           ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+           │  network/    │   │   dmx.c      │   │  dmx_led.c   │
+           │              │   │  (UART HAL)  │   │  (DMX→LED)   │
+           │  wifi_ap.c   │   │              │   │              │
+           │  web_server.c│   │ dmx_init()   │   │  callback    │
+           │  web_page.h  │   │ dmx_read()   │   │  API         │
+           │              │   │ dmx_write()  │   │              │
+           │  HTTP API    │   │ dmx_set_mode │   │  patch→LED   │
+           │  GET/POST    │   │ dmx_on_frame │   │  interp.     │
+           └──────────────┘   └──────────────┘   └──────────────┘
+                  │                                     │
+                  │    ┌────────────────────────────────┤
+                  │    │                                │
+                  ▼    ▼                                ▼
+           ┌──────────────┐                     ┌──────────────┐
+           │ app_handlers │                     │ led_driver/  │
+           │     .c       │                     │  ws2812.c    │
+           │              │                     │              │
+           │ handler_*()  │                     │  led_init()  │
+           │              │                     │  led_set_px  │
+           └──────────────┘                     │  led_show()  │
+                  │                             └──────────────┘
+                  ▼
+           ┌──────────────┐
+           │  utilite/    │
+           │              │
+           │  effects.c   │
+           │  patch_mgr.c │
+           │  settings_mgr│
+           │  udp_test.c  │
+           └──────────────┘
+```
+
+## Модули
+
+### dmx.c — UART DMX512 (чистый HAL)
+Только приём/передача через UART.
+
+```c
+void dmx_init(int tx1, int tx2, int rx1, int rx2, int dir);
+void dmx_read(int port, uint8_t *buf, int len);
+void dmx_write(int port, const uint8_t *frame, int len);
+void dmx_set_mode(dmx_mode_t m);
+void dmx_on_frame(dmx_frame_cb_t cb);
+void dmx_lock(void);
+void dmx_unlock(void);
+```
+
+**Не знает про:** LED, fallback, effects, patch, web
 
 ---
 
-## Техническое задание (ТЗ)
+### dmx_led.c — DMX → LED мост
+Callback API (function pointers).
 
-### 1. Цель проекта
-Создание компактного и быстрого контроллера-переводчика протокола DMX512 в сигналы управления адресной лентой WS2812 с возможностью беспроводного администрирования через веб-интерфейс и возможностью генерации тестовых DMX-последовательностей для пусконаладки светового оборудования.
+```c
+void dmx_led_init(const dmx_led_cbs_t *cbs);
+void dmx_led_recompute(void);
+void dmx_led_apply_fallback(void);
+```
 
-### 2. Функциональные требования
-
-#### 2.1. Режимы работы устройства
-1. **Режим сниффера (DMX_MODE_SNIFFER):**
-   * Устройство слушает входящую DMX-линию.
-   * Декодирует пакеты данных DMX512 в реальном времени.
-   * Выполняет сопоставление (патчинг) DMX-каналов со светодиодами ленты WS2812 согласно сохраненной таблице патчей.
-   * Контролирует наличие сигнала. При пропадании DMX-сигнала переходит в режим ожидания (по истечении настраиваемого таймаута окрашивает ленту в заданный fallback-цвет).
-2. **Режим тестера (DMX_MODE_TESTER):**
-   * Устройство генерирует и передает сигнал DMX512 в линию.
-   * Поддерживает режимы генерации:
-     * **Point (точечный тест):** изменение цвета (RGB) на конкретном стартовом адресе DMX.
-     * **Fill (заполнение):** заполнение DMX-пакета градиентом или определенным паттерном.
-     * **Rainbow (радуга):** генерация динамического эффекта бегущей радуги для проверки диммирования и смешивания цветов.
-
-#### 2.2. Аппаратный интерфейс DMX
-* Использование аппаратных UART-модулей ESP32 для приема и передачи.
-* Поддержка стандартов физического уровня RS-485 (с использованием внешних чипов трансиверов типа MAX485, ADM2486 или аналогичных).
-* Автоматическое управление переключением направления приема/передачи через пин RTS (режим `RS485 Half Duplex`).
-* Точная низкоуровневая детекция сигнала **BREAK** и времени **MAB** (Mark After Break) через регистры UART (`uart_ll_set_rx_tout`).
-* Поддерживаемые скорости обмена: 
-  * `250 kbps` (стандартный DMX512)
-  * `500 kbps` 
-  * `1000 kbps` (высокоскоростной DMX, использующийся в нестандартных проектах)
-
-#### 2.3. Управление адресной лентой (WS2812)
-* Поддержка лент длиной до 2048 пикселей.
-* Настраиваемый порядок следования цветов в ленте (RGB, GRB, BRG, BGR и т. д.).
-* Настраиваемое количество DMX-каналов на одну «точку» (3 канала для RGB, 4 канала для RGBW приборов).
-* Возможность инверсии (реверса) направления адресации ленты.
-
-#### 2.4. Беспроводной веб-интерфейс (Web UI)
-* Подключение к существующей Wi-Fi сети в режиме **Station (STA)**.
-* Встроенный HTTP-сервер на порту 80 с поддержкой REST API.
-* Веб-страница управления (встроенная в прошивку в виде сжатого HTML/JS) предоставляет:
-  * Переключение режима работы (Сниффер / Тестер).
-  * Изменение сетевых параметров и скоростей DMX-портов.
-  * Регулировку параметров ленты (длина, порядок каналов, таймаут fallback-режима).
-  * Графическую таблицу патчей (редактирование соответствия «DMX-адрес/юниверс -> Пиксель ленты»).
-  * Панель прямого ручного управления и тестирования пикселей ленты и DMX-каналов.
-
-#### 2.5. Хранение настроек и надежность
-* Сохранение конфигурации в энергонезависимую память микроконтроллера (NVS).
-* Механизм фильтрации повторных записей (Debounce с таймаутом 500 мс) для предотвращения ускоренного износа Flash-памяти при регулировке параметров ползунками из веб-интерфейса.
+**Ответственность:** патч → RGB, interpolation, sequential/parallel, fallback timer, led_refresh_task
 
 ---
 
-## Структура проекта
+### ws2812.c — LED-драйвер RMT
+Двойная буферизация, GRB conversion.
 
-### Исходный код (`/main`):
-* [main.c](file:///c:/DmxSnifer/dmx_sniffer/main/main.c) — инициализация компонентов, запуск планировщика FreeRTOS и основных фоновых задач.
-* [dmx_custom.c](file:///c:/DmxSnifer/dmx_sniffer/main/dmx_custom.c) / [dmx_custom.h](file:///c:/DmxSnifer/dmx_sniffer/main/dmx_custom.h) — кастомная аппаратная реализация протокола DMX512 на базе регистров UART.
-* [led_strip.c](file:///c:/DmxSnifer/dmx_sniffer/main/led_strip.c) / [led_strip.h](file:///c:/DmxSnifer/dmx_sniffer/main/led_strip.h) — логика управления адресными светодиодами.
-* [patch_manager.c](file:///c:/DmxSnifer/dmx_sniffer/main/patch_manager.c) / [patch_manager.h](file:///c:/DmxSnifer/dmx_sniffer/main/patch_manager.h) — управление таблицей сопоставления адресов DMX с пикселями.
-* [settings_manager.c](file:///c:/DmxSnifer/dmx_sniffer/main/settings_manager.c) / [settings_manager.h](file:///c:/DmxSnifer/dmx_sniffer/main/settings_manager.h) — запись и загрузка настроек устройства в NVS.
-* [wifi_ap.c](file:///c:/DmxSnifer/dmx_sniffer/main/wifi_ap.c) / [wifi_ap.h](file:///c:/DmxSnifer/dmx_sniffer/main/wifi_ap.h) — конфигурация подключения к Wi-Fi.
-* [web_server.c](file:///c:/DmxSnifer/dmx_sniffer/main/web_server.c) / [web_server.h](file:///c:/DmxSnifer/dmx_sniffer/main/web_server.h) — обработчики REST API запросов веб-клиента.
-* [web_page.h](file:///c:/DmxSnifer/dmx_sniffer/main/web_page.h) — упакованный веб-интерфейс (index.html/JS) в виде массива строк.
+**Публичный:** `led_init`, `led_set_pixel`, `led_show`, `led_fill`, `led_clear`
+**Внутренний:** `led_lock`, `led_get_colors`, `led_swap_banks`, `led_refresh`
 
-### Вспомогательные скрипты:
-* [extract_html.py](file:///c:/DmxSnifer/dmx_sniffer/extract_html.py) — скрипт для распаковки HTML-страницы из [web_page.h](file:///c:/DmxSnifer/dmx_sniffer/main/web_page.h) в файл [index.html](file:///c:/DmxSnifer/dmx_sniffer/data/index.html) для удобства разработки и стилизации.
-* [monitor60.py](file:///c:/DmxSnifer/dmx_sniffer/monitor60.py) — утилита для захвата и сохранения логов из COM-порта в файл для отладки.
+---
+
+### effects.c — Анимации
+Rainbow, breathe, running, wave.
+
+**API:** `effects_init`, `effects_set`, `effects_clear`, `effects_render`, `effects_is_active`
+
+---
+
+### app_handlers.c — Обработчики команд
+Реализация handler'ов для web сервера и dmx_led callback'ов.
+
+```c
+void app_handlers_init(void);  // вызывает dmx_led_init() с callback'ами
+```
+
+---
+
+### network/wifi_ap.c — WiFi + Status LED
+WiFi STA/AP toggle + status LED task.
+
+```c
+esp_err_t wifi_init(void);
+esp_err_t wifi_toggle(void);
+esp_err_t wifi_stop(void);
+esp_err_t wifi_start(void);
+bool wifi_is_on(void);
+void wifi_status_led_init(void);
+```
+
+---
+
+### network/web_server.c — HTTP REST API
+Проект-специфичный, вызывает `handler_*` функции из app_handlers.c напрямую.
+
+---
+
+### patch_manager.c — Таблица патчей
+CSV в SPIFFS. `g_patch` — массив entries[340].
+
+---
+
+### settings_manager.c — NVS
+Load/save с debounce 500ms.
+
+---
+
+### udp_test.c — UDP отладка/OTA
+Порт 5124.
+
+---
+
+## Потоки данных
+
+```
+UART RX ISR → dmx.c (double-buffer) → callback → dmx_led.c → ws2812.c → LED
+                                                       ↑
+HTTP POST → web_server.c → handler_*() → g_dmx.field = value ┘
+```
+
+## Задачи FreeRTOS
+
+| Задача     | Ядро | Приоритет | Модуль       |
+|------------|------|-----------|--------------|
+| dmx_rx0    | 1    | 4         | dmx.c        |
+| dmx_rx1    | 1    | 4         | dmx.c        |
+| dmx_tx     | 1    | 5         | dmx.c        |
+| led_ref    | 1    | 5         | dmx_led.c    |
+| udp_test   | 1    | 5         | udp_test.c   |
+| status_led | 0    | 1         | wifi_ap.c    |
+
+## Структура файлов
+
+```
+main/
+├── main.c            ← только init вызовы
+├── dmx.c/.h          ← чистый UART HAL
+├── dmx_led.c/.h      ← callback API, DMX→LED мост
+├── settings.h        ← hardware config
+├── led_strip.h       ← compatibility redirect
+├── favicon.ico
+├── led_driver/
+│   └── ws2812.c/.h
+├── network/
+│   ├── web_server.c/.h
+│   ├── wifi_ap.c/.h
+│   └── web_page.h
+└── utilite/
+    ├── app_handlers.c/.h  ← handler'ы + dmx_led init
+    ├── effects.c/.h
+    ├── patch_manager.c/.h
+    ├── settings_manager.c/.h
+    └── udp_test.c/.h
+```

@@ -17,7 +17,6 @@ typedef struct {
 } patch_map_t;
 
 extern patch_map_t g_patch;
-extern uint16_t    g_total_leds;
 
 void     patch_init(void);
 void     patch_load(void);

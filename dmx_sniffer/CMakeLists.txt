@@ -8,4 +8,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(dmx_sniffer)
 
-# spiffs_create_partition_image(storage data FLASH_IN_PROJECT)
+spiffs_create_partition_image(storage www FLASH_IN_PROJECT)

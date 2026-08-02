@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+    <style>
+    .bg{
+        background-color: black;
+    }
+  
+    .d{
+        background-color: aqua;
+        font-size: larger;
+        width: 100%;
+       margin: 5px;
+    }
+    .d:hover{
+        background-color: red;
+    }
+    .container{
+        display: flex;
+        flex-direction: row;
+        justify-content: center;
+        /* align-items: stretch; */
+        background-color: grey;
+        padding: 2px;
+    }
+    </style>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body class="bg">
+    <div class="container">
+        <button id="bt1"  >Click</button>
+        <button id="bt2"  >Click</button>
+        <input  id="briteCtr" width="150px" type="range" oninput="onBrightChange(Number(this.value))">
+    </div>
+    <div class="container">
+        <button id="bt1" class="d" >Click</button>
+        <button id="bt2" class="d" >Click</button>
+        <input class="d" id="briteCtr" type="range" oninput="onBrightChange(Number(this.value))">
+    </div>
+</body>
+<script>
+    let brgCtr = document.getElementById("briteCtr");
+  document.addEventListener('DOMContentLoaded', () => {
+    console.log('DOM готов, можно искать теги!');
+    console.log('загружаем значения');
+});
+    function onBrightChange(i){
+        
+        console.log(i);
+    }
+</script>
+</html>

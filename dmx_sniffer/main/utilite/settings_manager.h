@@ -5,13 +5,13 @@
 
 #pragma once
 
-#include "dmx.h"
+#include "dmx/dmx.h"
 #include "led_strip.h"
 
 /**
- * @brief Загрузка сохраненных настроек из NVS в глобальные структуры данных
+ * @brief Инициализация NVS Flash + загрузка настроек
  */
-void settings_load(void);
+void settings_init(void);
 
 /**
  * @brief Сохранение текущих настроек в NVS с защитой от быстрого износа (debounce)

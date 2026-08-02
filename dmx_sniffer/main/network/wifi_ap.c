@@ -1,4 +1,5 @@
 #include "wifi_ap.h"
+#include "web_server.h"
 #include "settings.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -6,6 +7,9 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lwip/ip_addr.h"
 #include <string.h>
 
@@ -26,7 +30,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-esp_err_t wifi_init(void) {
+static esp_err_t wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -110,4 +114,26 @@ esp_err_t wifi_start(void) {
 
 bool wifi_is_on(void) {
     return s_wifi_enabled;
+}
+
+static void status_led_task(void *arg) {
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = (1ULL << STATUS_LED_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led_cfg);
+    while (1) {
+        gpio_set_level(STATUS_LED_GPIO, wifi_is_on() ? 0 : 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+esp_err_t network_init(void) {
+    wifi_init();
+    xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
+    web_server_init();
+    return ESP_OK;
 }

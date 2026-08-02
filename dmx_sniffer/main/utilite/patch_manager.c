@@ -35,9 +35,6 @@ static SemaphoreHandle_t s_patch_mutex = NULL;
 /** Глобальная таблица патчей */
 patch_map_t g_patch = { .count = 0 };
 
-/** Глобальное количество LED (используется для пересчёта lookups) */
-uint16_t    g_total_leds = 1000;
-
 /**
  * @brief Монтирование файловой системы SPIFFS
  *

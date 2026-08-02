@@ -13,7 +13,7 @@
  */
 
 #include "udp_test.h"
-#include "dmx/dmx_bus.h"
+#include "dmx/dmx.h"
 #include "settings.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
