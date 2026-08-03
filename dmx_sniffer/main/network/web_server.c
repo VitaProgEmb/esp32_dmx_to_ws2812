@@ -1,6 +1,16 @@
 /**
  * @file web_server.c
  * @brief HTTP-сервер — прямые вызовы handler'ов
+ *
+ * Реализует REST API для веб-интерфейса сниффера DMX.
+ * Все эндпоинты работают через esp_http_server; данные
+ * передаются в JSON (cJSON) или как бинарный поток (octet-stream).
+ *
+ * Потоки данных (каналы DMX, превью LED) отдаются чанками
+ * по 4096 байт для минимального потребления RAM.
+ *
+ * @note Обработчики не используют асинхронные коллбэки —
+ *       вся логика выполняется синхронно в контексте HTTP-потока.
  */
 
 #include "web_server.h"
@@ -12,6 +22,7 @@
 #include "utilite/patch_manager.h"
 #include "utilite/settings_manager.h"
 #include "cJSON.h"
+#include "esp_http_server.h"
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_timer.h"
@@ -21,9 +32,21 @@
 #include "freertos/task.h"
 #include <string.h>
 
+/** @brief Тег логирования ESP-IDF для модуля web_server */
 static const char *TAG = "WEB";
+
+/** @brief Дескриптор запущенного HTTP-сервера (NULL если не запущен) */
 static httpd_handle_t s_server = NULL;
 
+/**
+ * @brief Инициализирует файловую систему SPIFFS
+ *
+ * Монтирует раздел "storage" по пути "/spiffs" с автоматическим
+ * форматированием при первом запуске (format_if_mount_failed).
+ * Используется для хранения сжатого HTML веб-интерфейса.
+ *
+ * @return ESP_OK при успешном монтировании, код ошибки ESP-IDF
+ */
 static esp_err_t init_spiffs(void) {
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/spiffs", .partition_label = "storage",
@@ -34,23 +57,69 @@ static esp_err_t init_spiffs(void) {
     return ret;
 }
 
+/**
+ * @brief Читает тело HTTP-запроса в буфер
+ *
+ * Извлекает тело POST/PUT запроса в предоставленный буфер
+ * и добавляет нуль-терминатор для корректной обработки строк.
+ *
+ * @param[in]  req  дескриптор HTTP-запроса
+ * @param[out] buf  целевой буфер для данных
+ * @param[in]  max  максимальный размер буфера (включая '\0')
+ * @return количество прочитанных байт, или <= 0 при ошибке/пустом теле
+ */
 static int read_body(httpd_req_t *req, char *buf, int max) {
     int len = httpd_req_recv(req, buf, max - 1);
     if (len > 0) buf[len] = '\0';
     return len;
 }
 
+/**
+ * @brief Отправляет стандартный JSON-ответ {"ok":true}
+ *
+ * Устанавливает Content-Type: application/json и отправляет
+ * короткий положительный ответ. Используется большинством
+ * POST-обработчиков как быстрый ответ без данных.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t resp_ok(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+/**
+ * @brief Ограничивает целочисленное значение в диапазоне [lo, hi]
+ *
+ * Вспомогательная функция для валидации входных параметров
+ * из JSON — предотвращает передачу некорректных значений
+ * в нижние модули (handler'ы, DMX, LED).
+ *
+ * @param[in] v  исходное значение
+ * @param[in] lo нижняя граница (включительно)
+ * @param[in] hi верхняя граница (включительно)
+ * @return значение, ограниченное диапазоном [lo, hi]
+ */
 static int clamp(int v, int lo, int hi) {
-    if (v < lo) return lo; if (v > hi) return hi; return v;
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
-/* ===== GET ===== */
+/* ===== GET-обработчики ===== */
 
+/**
+ * @brief Обработчик GET / — отдаёт HTML веб-интерфейса
+ *
+ * Отдаёт сжатый (gzip) HTML из глобального массива index_html_gz
+ * чанками по 4096 байт. Устанавливает заголовки кеширования
+ * (Cache-Control: public, max-age=3600) для уменьшения
+ * повторных запросов при навигации.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке, код ошибки ESP-IDF
+ */
 static esp_err_t handle_index(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
@@ -66,6 +135,20 @@ static esp_err_t handle_index(httpd_req_t *req) {
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
+/**
+ * @brief Обработчик GET /api/state — текущее состояние сниффера
+ *
+ * Возвращает JSON с полным состоянием устройства:
+ * - mode: строковый режим ("sniffer"/"tester"/"patch")
+ * - dmx0/dmx1: активность на DMX-портах (1 если данные за <2с)
+ * - leds/leds2: количество LED на каждой ленте
+ * - reverse/shift/interpolate: настройки отображения
+ * - fb_r/fb_g/fb_b/fb_timeout: цвет fallback-режима
+ * - lr0/lr1: timestamp последнего приёма DMX (мс)
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t handle_state(httpd_req_t *req) {
     char json[1024];
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -91,6 +174,16 @@ static esp_err_t handle_state(httpd_req_t *req) {
     return httpd_resp_sendstr(req, json);
 }
 
+/**
+ * @brief Обработчик GET /api/channels — сырые DMX-каналы
+ *
+ * Возвращает бинарный блок 1024 байта: 512 байт DMX0 + 512 байт DMX1.
+ * Используется веб-интерфейсом для отображения实时-значений
+ * всех 512 каналов на каждом порту.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t handle_channels(httpd_req_t *req) {
     static uint8_t buf[1024];
     for (int p = 0; p < 2; p++) dmx_read(p, buf + p * DMX_CHANNELS, DMX_CHANNELS);
@@ -98,6 +191,16 @@ static esp_err_t handle_channels(httpd_req_t *req) {
     return httpd_resp_send(req, (const char *)buf, sizeof(buf));
 }
 
+/**
+ * @brief Обработчик GET /api/led_preview — превью цветов LED-ленты
+ *
+ * Возвращает бинарный массив RGB-значений по одному на каждую
+ * светильниковую патч-запись. Цвета берутся из dmx_led_get_fixture_colors()
+ * — это вычисленные цвета после маппинга DMX→LED.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t handle_led_preview(httpd_req_t *req) {
     static uint8_t buf[2048];
     const uint8_t (*fc)[3] = dmx_led_get_fixture_colors();
@@ -111,6 +214,15 @@ static esp_err_t handle_led_preview(httpd_req_t *req) {
     return httpd_resp_send(req, (const char *)buf, pos);
 }
 
+/**
+ * @brief Обработчик GET /api/blob — дамп DMX-каналов (alias channels)
+ *
+ * Возвращает те же 1024 байта сырых DMX-каналов что и /api/channels,
+ * но через отдельный эндпоинт для совместимости со старыми клиентами.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t handle_blob(httpd_req_t *req) {
     uint8_t blob[1024];
     for (int p = 0; p < 2; p++) dmx_read(p, blob + p * DMX_CHANNELS, DMX_CHANNELS);
@@ -118,6 +230,16 @@ static esp_err_t handle_blob(httpd_req_t *req) {
     return httpd_resp_send(req, (const char *)blob, sizeof(blob));
 }
 
+/**
+ * @brief Обработчик GET /api/patch — патч в формате CSV
+ *
+ * Возвращает текущий патч-таблицу в виде CSV-строки
+ * (port,address на каждую запись). Если патч пуст,
+ * возвращается пустой JSON-массив "[]".
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной отправке
+ */
 static esp_err_t handle_patch_get(httpd_req_t *req) {
     char *csv = patch_to_csv_string();
     if (csv) { httpd_resp_set_type(req, "text/csv"); esp_err_t r = httpd_resp_sendstr(req, csv); free(csv); return r; }
@@ -125,8 +247,19 @@ static esp_err_t handle_patch_get(httpd_req_t *req) {
     return httpd_resp_sendstr(req, "[]");
 }
 
-/* ===== POST → handler_() ===== */
+/* ===== POST-обработчики ===== */
 
+/**
+ * @brief Обработчик POST /api/mode — переключение режима работы
+ *
+ * Принимает JSON {"mode": "sniffer"|"tester"|"patch"}.
+ * Устанавливает соответствующий режим в g_dmx.mode.
+ * При некорректном или отсутствующем теле — не делает ничего
+ * и возвращает {"ok":true}.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_mode(httpd_req_t *req) {
     char buf[128]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -139,6 +272,16 @@ static esp_err_t handle_mode(httpd_req_t *req) {
     cJSON_Delete(root); handler_mode(mode); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/leds — настройка количества LED
+ *
+ * Принимает JSON {"count": N, "strip": 0|1}.
+ * Устанавливает количество LED на указанной ленте (0 или 1).
+ * Count ограничивается диапазоном [1, LED_STRIP_MAX_LEDS].
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_leds(httpd_req_t *req) {
     char buf[128]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -149,6 +292,20 @@ static esp_err_t handle_leds(httpd_req_t *req) {
     cJSON_Delete(root); handler_led_count(strip, count); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/led_config — настройки отображения LED
+ *
+ * Принимает JSON с частичными обновлениями:
+ * - "reverse": bool — инвертировать порядок пикселей
+ * - "interpolate": bool — интерполяция между каналами
+ * - "shift": int [0..255] — сдвиг яркости
+ * - "mode": "sequential"|"parallel" — режим отрисовки
+ *
+ * Отсутствующие поля не изменяются.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_led_config(httpd_req_t *req) {
     char buf[256]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -164,6 +321,21 @@ static esp_err_t handle_led_config(httpd_req_t *req) {
     cJSON_Delete(root); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/led_test — тестирование LED-ленты
+ *
+ * Принимает JSON с параметрами тестового эффекта:
+ * - "pixel": int — начальный пиксель [0..MAX]
+ * - "count": int — количество пикселей [1..MAX]
+ * - "r","g","b": int [0..255] — цвет тестового сигнала
+ * - "speed": int [5..200] — скорость эффекта
+ * - "mode": "point"|"fill"|"rainbow"|"running"|"breathe"|"wave"|"clear"
+ *
+ * При mode="clear" вызывается handler_led_clear() — все пиксели гаснут.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_led_test(httpd_req_t *req) {
     char buf[256]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -191,6 +363,19 @@ static esp_err_t handle_led_test(httpd_req_t *req) {
     return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/dmx_test — тестирование DMX-выхода
+ *
+ * Принимает JSON с параметрами тестового DMX-сигнала:
+ * - "port": int [0..1] — DMX-порт
+ * - "channel": int [1..512] — начальный канал
+ * - "r","g","b": int [0..255] — цвет
+ * - "mode": "point"|"fill" — режим заполнения
+ * - "count": int [1..512] — количество каналов
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_dmx_test(httpd_req_t *req) {
     char buf[256]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -207,6 +392,17 @@ static esp_err_t handle_dmx_test(httpd_req_t *req) {
     cJSON_Delete(root); handler_dmx_test(port, channel, r, g, b, mode, count); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/fixture — настройки светильника
+ *
+ * Принимает JSON с параметрами патч-таблицы:
+ * - "channel_order": int [0..5] — порядок каналов (RGB/GRB/etc)
+ * - "fallback_r","fallback_g","fallback_b": int [0..255] — fallback-цвет
+ * - "timeout": int [10..5000] — таймаут fallback в мс
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_fixture(httpd_req_t *req) {
     char buf[256]; if (read_body(req, buf, sizeof(buf)) <= 0) return resp_ok(req);
     cJSON *root = cJSON_Parse(buf); if (!root) return resp_ok(req);
@@ -221,6 +417,21 @@ static esp_err_t handle_fixture(httpd_req_t *req) {
     cJSON_Delete(root); handler_fixture_settings(co, fr, fg, fb, ft); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/patch — загрузка патч-таблицы
+ *
+ * Принимает JSON-массив объектов [{"port":N,"addr":N}, ...]
+ * или CSV-строку "port,address\n...". Максимальный размер тела — 32 КБ.
+ *
+ * После загрузки:
+ * 1. Очищает текущий патч
+ * 2. Заполняет g_patch из JSON/CSV
+ * 3. Сохраняет патч в NVS
+ * 4. Пересчитывает маппинг LED
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешной обработке
+ */
 static esp_err_t handle_patch_post(httpd_req_t *req) {
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > 32768) return resp_ok(req);
@@ -252,12 +463,49 @@ static esp_err_t handle_patch_post(httpd_req_t *req) {
     free(buf); patch_save(); dmx_led_recompute(); return resp_ok(req);
 }
 
+/**
+ * @brief Обработчик POST /api/save — сохранение настроек в NVS
+ *
+ * Сохраняет текущие настройки (режим, LED-конфиг, патч) в NVS-хранилище.
+ * Вызывает settings_save() для персистентности между перезагрузками.
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешном сохранении
+ */
 static esp_err_t handle_save(httpd_req_t *req) { settings_save(); return resp_ok(req); }
 
+/**
+ * @brief Обработчик POST /api/reboot — программная перезагрузка
+ *
+ * Отправляет положительный ответ клиенту, затем ждёт 200 мс
+ * для завершения отправки и вызывает esp_restart().
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK (не возвращается — устройство перезагружается)
+ */
 static esp_err_t handle_reboot(httpd_req_t *req) {
     esp_err_t r = resp_ok(req); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); return r;
 }
 
+/**
+ * @brief Обработчик POST /api/ota — обновление прошивки по воздуху
+ *
+ * Принимает полный образ прошивки в теле запроса (raw binary).
+ * Записывает образ в следующий доступный OTA-раздел,
+ * устанавливает его как загрузочный и перезагружается.
+ *
+ * При ошибках возвращает JSON с полем "error":
+ * - "no partition": нет доступного раздела
+ * - "ota_begin": ошибка начала записи
+ * - "timeout": превышено время ожидания данных
+ * - "read": ошибка чтения тела запроса
+ * - "write": ошибка записи в раздел
+ * - "ota_end": ошибка завершения записи
+ * - "boot_part": ошибка смены загрузочного раздела
+ *
+ * @param[in] req дескриптор HTTP-запроса
+ * @return ESP_OK при успешном обновлении (не возвращается — перезагрузка)
+ */
 static esp_err_t handle_ota(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     esp_ota_handle_t ota;
@@ -279,8 +527,24 @@ static esp_err_t handle_ota(httpd_req_t *req) {
     httpd_resp_sendstr(req, "{\"ok\":true}"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK;
 }
 
-/* ===== INIT ===== */
+/* ===== Инициализация сервера ===== */
 
+/**
+ * @brief Инициализирует и запускает HTTP-сервер со всеми эндпоинтами
+ *
+ * Алгоритм:
+ * 1. Монтирует SPIFFS для доступа к статическим файлам
+ * 2. Настраивает httpd: max_uri=24, stack=8192, LRU purge, send_timeout=30с
+ * 3. Запускает httpd с 3 попытками (с задержкой 2с между ними)
+ * 4. Регистрирует все URI-обработчики из таблицы uris[]
+ *
+ * Зарегистрированные эндпоинты:
+ * GET:  /, /api/state, /api/channels, /api/led_preview, /api/blob, /api/patch
+ * POST: /api/mode, /api/leds, /api/led_config, /api/led_test, /api/dmx_test,
+ *        /api/fixture, /api/patch, /api/save, /api/reboot, /api/ota
+ *
+ * @return ESP_OK при успешном запуске и регистрации, ESP_FAIL при ошибке
+ */
 esp_err_t web_server_init(void) {
     init_spiffs();
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -319,6 +583,13 @@ reg:;
     return ESP_OK;
 }
 
+/**
+ * @brief Останавливает HTTP-сервер
+ *
+ * Сохраняет дескриптор в локальную переменную, обнуляет s_server,
+ * останавливает httpd и ждёт 500 мс для завершения всех
+ * активных соединений. Потом безопасно освобождает ресурсы.
+ */
 void web_server_stop(void) {
     if (s_server) { httpd_handle_t srv = s_server; s_server = NULL; httpd_stop(srv); vTaskDelay(pdMS_TO_TICKS(500)); }
 }

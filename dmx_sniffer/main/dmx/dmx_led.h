@@ -1,59 +1,157 @@
 /**
  * @file dmx_led.h
- * @brief DMX → LED мост (чистый API, без signal/event_bus)
+ * @brief Мост DMX512 → WS2812: настройки, API
+ *
+ * Данный заголовочный файл описывает интерфейс модуля-моста,
+ * связывающего приём DMX512-кадров с управлением адресной
+ * светодиодной лентой WS2812 (или аналогичной).  Модуль
+ * отвечает за:
+ *   - сопоставление DMX-фикстур с диапазонами пикселей
+ *   - перестановку цветовых каналов (RGB / GRB / …)
+ *   - линейную интерполяцию цвета между фикстурами
+ *   - обратный отсчёт (fallback) при потере DMX-сигнала
+ *
+ * Модуль не зависит от signal.h и event_bus.h — все внешние
+ * взаимодействия осуществляются через callback-структуру
+ * @c dmx_led_cbs_t, передаваемую в dmx_led_init().
+ *
+ * @note Все параметры, изменяемые из внешних обработчиков
+ *       (настройки, режим, цвет), доступны через общую
+ *       структуру @c g_led_settings и защищены мьютексом DMX.
  */
 
 #pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "utilite/handlers.h"
 
-/* ===== Callback API ===== */
+/* ===== Настройки LED ===== */
 
-typedef struct {
-    void (*on_mode)(uint8_t mode);              /* 0=sniffer 1=tester 2=patch */
-    void (*on_led_test)(uint8_t mode, uint8_t r, uint8_t g, uint8_t b,
-                        uint8_t speed, uint16_t pixel, uint16_t count);
-    void (*on_led_clear)(void);
-    void (*on_led_count)(uint8_t strip, uint16_t count);
-    void (*on_led_reverse)(bool on);
-    void (*on_led_mode)(bool sequential);
-    void (*on_led_shift)(uint8_t shift);
-    void (*on_led_interpolate)(bool on);
-    void (*on_dmx_test)(uint8_t port, uint8_t channel,
-                        uint8_t r, uint8_t g, uint8_t b,
-                        bool fill, uint16_t count);
-    void (*on_fixture_settings)(uint8_t channel_order,
-                                uint8_t fallback_r, uint8_t fallback_g, uint8_t fallback_b,
-                                uint16_t fallback_timeout_ms);
-} dmx_led_cbs_t;
-
-/* ===== LED Settings ===== */
-
+/**
+ * @brief Порядок цветовых каналов WS2812
+ *
+ * Перечисление определяет, в каком порядке байты R, G и B
+ * из DMX-кадра должны быть записаны в буфер LED-драйвера.
+ * Каждое значение задаёт маппинг:
+ *   индекс в DMX → позиция в массиве [R, G, B].
+ *
+ * Используется таблица @c s_order_map в dmx_led.c для
+ * быстрой перестановки без условных переходов.
+ */
 typedef enum {
+    /** @brief R→0, G→1, B→2 — стандартный порядок */
     CH_ORDER_RGB = 0,
+    /** @brief R→0, B→1, G→2 */
     CH_ORDER_RBG,
+    /** @brief G→0, R→1, B→2 — порядок по умолчанию WS2812 */
     CH_ORDER_GRB,
+    /** @brief G→0, B→1, R→2 */
     CH_ORDER_GBR,
+    /** @brief B→0, R→1, G→2 */
     CH_ORDER_BRG,
+    /** @brief B→0, G→1, R→2 */
     CH_ORDER_BGR,
+    /** @brief Количество поддерживаемых порядков (для валидации) */
     CH_ORDER_COUNT
 } channel_order_t;
 
+/**
+ * @brief Глобальные настройки DMX→LED моста
+ *
+ * Структура хранит текущие параметры работы моста.
+ * Поля помечены @c volatile, так как могут изменяться
+ * из обработчиков WebSocket/API и читаться из задачи LED.
+ * Все изменения должны выполняться под мьютексом DMX
+ * (dmx_lock / dmx_unlock).
+ */
 typedef struct {
+    /** @brief Обратный порядок пикселей (true — лента «задом наперёд») */
     volatile bool    reverse;
+
+    /** @brief Сдвиг начального пикселя (в пикселях) */
     volatile uint16_t shift;
+
+    /** @brief Включение линейной интерполяции между фикстурами.
+     *         true — плавный градиент, false — жёсткие границы. */
     volatile bool    interpolate;
+
+    /** @brief Порядок цветовых каналов (см. @c channel_order_t) */
     volatile channel_order_t channel_order;
-    volatile uint8_t  fallback_r, fallback_g, fallback_b;
+
+    /** @brief Цвет fallback (красный компонент) при потере сигнала */
+    volatile uint8_t  fallback_r;
+    /** @brief Цвет fallback (зелёный компонент) при потере сигнала */
+    volatile uint8_t  fallback_g;
+    /** @brief Цвет fallback (синий компонент) при потере сигнала */
+    volatile uint8_t  fallback_b;
+
+    /** @brief Таймаут fallback в миллисекундах.
+     *         Если за это время не получен новый DMX-кадр,
+     *         LED переключаются на fallback-цвет.
+     *         0 — fallback отключён. */
     volatile uint16_t fallback_timeout_ms;
 } dmx_led_settings_t;
 
+/** @brief Глобальный экземпляр настроек моста (определён в dmx_led.c) */
 extern dmx_led_settings_t g_led_settings;
 
 /* ===== API ===== */
 
+/**
+ * @brief Инициализация DMX→LED моста
+ *
+ * Создаёт семафор для обновления LED, подписывается на
+ * DMX-кадры через dmx_on_frame(), запускает таймер fallback
+ * и задачу обновления LED на ядре 1.
+ *
+ * @param[in] cbs  Указатель на структуру callback-функций
+ *                 (on_mode, on_led_test и т.д.), вызываемых
+ *                 из обработчиков WebSocket-команд.
+ *
+ * @note Вызывается один раз при старте системы.
+ */
 void dmx_led_init(const dmx_led_cbs_t *cbs);
+
+/**
+ * @brief Пересчёт распределения фикстур по пикселям LED
+ *
+ * Функция вычисляет для каждой фикстуры из DMX-патча
+ * начальный индекс и количество пикселей на ленте.
+ * Распределение равномерное: фикстуры разделяют общее
+ * количество пикселей пропорционально.
+ *
+ * Формула для фикстуры @c f при @c n фикстурах и @c m пикселях:
+ *   start[f] = f * m / n
+ *   count[f] = start[f+1] - start[f]   (последняя → m - start[f])
+ *
+ * Должна вызываться при изменении количества пикселей
+ * или состава DMX-патча.
+ */
 void dmx_led_recompute(void);
+
+/**
+ * @brief Применить fallback-цвет ко всей ленте
+ *
+ * При потере DMX-сигнала (таймаут) или в режиме сниффера
+ * все пиксели LED-ленты (порт 0) устанавливаются в
+ * цвет из g_led_settings.fallback_{r,g,b} с учётом
+ * порядка каналов.
+ *
+ * Функция безопасна: проверяет активность эффектов
+ * и наличие пикселей перед записью.
+ */
 void dmx_led_apply_fallback(void);
+
+/**
+ * @brief Получить указатель на массив цветов фикстур
+ *
+ * Возвращает указатель на внутренний буфер @c s_fixture_colors,
+ * содержащий текущие RGB-значения для каждой фикстуры
+ * (с учётом порядка каналов). Используется модулем
+ * Effects для чтения текущих цветов.
+ *
+ * @return Указатель на массив [PATCH_MAX_ENTRIES][3]
+ *         (каждый элемент — R, G, B).
+ */
 const uint8_t (*dmx_led_get_fixture_colors(void))[3];

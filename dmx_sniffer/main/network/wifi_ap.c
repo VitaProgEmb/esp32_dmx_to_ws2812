@@ -1,3 +1,16 @@
+/**
+ * @file wifi_ap.c
+ * @brief Реализация модуля Wi-Fi (STA + AP с toggle)
+ *
+ * Управляет Wi-Fi подключением, статусной LED и HTTP-сервером.
+ * Поддерживает два режима работы, выбираемые при компиляции:
+ * - WIFI_MODE_AP_RELEASE=1: режим AP (своя точка доступа 192.168.4.1)
+ * - WIFI_MODE_AP_RELEASE=0: режим STA (подключение к домашней сети)
+ *
+ * При STA-режиме автоматическое переподключение при обрыве связи.
+ * Статусная LED мигает: включена если Wi-Fi активен, выключена если нет.
+ */
+
 #include "wifi_ap.h"
 #include "web_server.h"
 #include "settings.h"
@@ -13,9 +26,25 @@
 #include "lwip/ip_addr.h"
 #include <string.h>
 
+/** @brief Тег логирования ESP-IDF для модуля Wi-Fi */
 static const char *TAG = "WIFI";
+
+/** @brief Флаг текущего состояния Wi-Fi (true=включён, false=выключен) */
 static bool s_wifi_enabled = false;
 
+/**
+ * @brief Обработчик событий Wi-Fi и IP
+ *
+ * Обрабатывает два типа событий:
+ * - WIFI_EVENT: STA_START → автоматическое подключение;
+ *   STA_DISCONNECTED → повторная попытка подключения (если WiFi включён)
+ * - IP_EVENT: STA_GOT_IP → логирование полученного IP-адреса
+ *
+ * @param[in] arg   пользовательский аргумент (не используется)
+ * @param[in] base  база события (WIFI_EVENT или IP_EVENT)
+ * @param[in] id    идентификатор события
+ * @param[in] data  данные события (ip_event_got_ip_t для IP_EVENT)
+ */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data) {
     if (base == WIFI_EVENT) {
@@ -30,6 +59,25 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+/**
+ * @brief Инициализирует Wi-Fi драйвер и настраивает режим сети
+ *
+ * Алгоритм:
+ * 1. Инициализирует стек TCP/IP (esp_netif_init)
+ * 2. Создаёт event loop по умолчанию
+ * 3. Инициализирует Wi-Fi драйвер с дефолтными настройками
+ * 4. Регистрирует обработчики событий WIFI_EVENT и IP_EVENT
+ * 5. В зависимости от WIFI_MODE_AP_RELEASE:
+ *    - AP: создаёт netif AP, настраивает IP 192.168.4.1, DHCP-сервер,
+ *      SSID/пароль из Kconfig, запускает AP
+ *    - STA: создаёт netif STA, настраивает SSID/пароль из Kconfig,
+ *      порог аутентификации WPA2, запускает STA
+ *
+ * @note После инициализации WiFi остаётся выключенным (s_wifi_enabled=false).
+ *       Для запуска необходимо вызвать wifi_start().
+ *
+ * @return ESP_OK при успешной инициализации
+ */
 static esp_err_t wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -89,6 +137,14 @@ static esp_err_t wifi_init(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief Переключает Wi-Fi: вкл→выкл, выкл→вкл
+ *
+ * Простейший toggle-механизм: проверяет текущий флаг
+ * и вызывает соответствующую функцию wifi_stop() или wifi_start().
+ *
+ * @return ESP_OK при успешном переключении
+ */
 esp_err_t wifi_toggle(void) {
     if (s_wifi_enabled) {
         return wifi_stop();
@@ -97,6 +153,18 @@ esp_err_t wifi_toggle(void) {
     }
 }
 
+/**
+ * @brief Останавливает Wi-Fi
+ *
+ * 1. Сбрасывает флаг s_wifi_enabled
+ * 2. Отключается от текущей точки доступа (esp_wifi_disconnect)
+ * 3. Полностью останавливает Wi-Fi драйвер (esp_wifi_stop)
+ *
+ * @note В STA-режиме обработчик events автоматически
+ *       прекратит попытки переподключения при s_wifi_enabled=false.
+ *
+ * @return ESP_OK при успешной остановке
+ */
 esp_err_t wifi_stop(void) {
     ESP_LOGI(TAG, "WiFi STOP");
     s_wifi_enabled = false;
@@ -105,6 +173,19 @@ esp_err_t wifi_stop(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief Запускает Wi-Fi
+ *
+ * 1. Устанавливает флаг s_wifi_enabled
+ * 2. Запускает Wi-Fi драйвер (esp_wifi_start)
+ *
+ * В STA-режиме: event_handler автоматически вызовет esp_wifi_connect()
+ * при WIFI_EVENT_STA_START. При обрыве — переподключится автоматически.
+ *
+ * В AP-режиме: начинает вещание собственной точки доступа.
+ *
+ * @return ESP_OK при успешном запуске
+ */
 esp_err_t wifi_start(void) {
     ESP_LOGI(TAG, "WiFi START");
     s_wifi_enabled = true;
@@ -112,10 +193,28 @@ esp_err_t wifi_start(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief Возвращает текущее состояние Wi-Fi
+ *
+ * @return true если Wi-Fi активен (включён и подключён/вещает),
+ *         false если остановлен
+ */
 bool wifi_is_on(void) {
     return s_wifi_enabled;
 }
 
+/**
+ * @brief Задача мигания статусной LED
+ *
+ * Настраивает GPIO статусной LED как выход и мигает с периодом 200 мс:
+ * - LED включена (LOW) если Wi-Fi активен
+ * - LED выключена (HIGH) если Wi-Fi остановлен
+ *
+ * Запускается как FreeRTOS-задача на ядре 0 с минимальным приоритетом (1).
+ * Работает бесконечно — не завершается никогда.
+ *
+ * @param[in] arg пользовательский аргумент (не используется)
+ */
 static void status_led_task(void *arg) {
     gpio_config_t led_cfg = {
         .pin_bit_mask = (1ULL << STATUS_LED_GPIO),
@@ -131,6 +230,20 @@ static void status_led_task(void *arg) {
     }
 }
 
+/**
+ * @brief Инициализирует сетевой стек
+ *
+ * Главная точка входа для модуля сети. Порядок критичен:
+ * 1. wifi_init() — инициализация Wi-Fi драйвера (без запуска)
+ * 2. status_led_task — запуск задачи мигания LED (на ядре 0)
+ * 3. web_server_init() — запуск HTTP-сервера
+ *
+ * @note Wi-Fi остаётся выключенным после вызова.
+ *       Для включения нужно вызвать wifi_toggle() или wifi_start()
+ *       из обработчика пользовательского ввода (кнопка, UART).
+ *
+ * @return ESP_OK при успешной инициализации
+ */
 esp_err_t network_init(void) {
     wifi_init();
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);

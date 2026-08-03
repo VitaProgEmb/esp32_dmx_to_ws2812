@@ -1,8 +1,30 @@
 /**
  * @file dmx.c
- * @brief DMX512 UART HAL — приём, передача, переключение режимов
+ * @brief Реализация DMX512 UART HAL — приём, передача, переключение режимов
  *
- * Чистый модуль: UART RX ISR + TX FIFO. Никакой логики с LED, fallback, effects.
+ * Данный модуль реализует чистый HAL (Hardware Abstraction Layer) для протокола DMX512
+ * на базе UART. Поддерживает два порта с независимым приёмом и передачей.
+ *
+ * Архитектура модуля:
+ *   - UART RX ISR (Interrupt Service Routine) — обработка прерываний от UART
+ *   - Задачи приема (dmx_rx_task) — обработка полученных кадров
+ *   - Задача передачи (dmx_tx_task) — генерация DMX данных
+ *   - Публичный API — интерфейс для других модулей
+ *
+ * Параметры протокола DMX512:
+ *   - Скорость передачи: 250 кбит/с (250000 бод)
+ *   - Формат данных: 8N2 (8 данных, без проверки чётности, 2 стоп-бита)
+ *   - Количество каналов: 512 (нумерация с 1 до 512)
+ *   - Длина кадра: 513 байт (1 старт-код + 512 каналов данных)
+ *
+ * Состояния UART RX ISR (конечный автомат обнаружения кадров):
+ *   1. Ожидание break-сигнала (начало нового кадра)
+ *   2. Обработка break — сброс состояния, подготовка к приему
+ *   3. Прием данных — заполнение буфера до следующего break
+ *   4. Завершение кадра — копирование данных, уведомление задачи
+ *
+ * @note Модуль не содержит логики управления LED, fallback-механизмов или эффектов.
+ *       Это чистый UART HAL для работы с DMX512.
  */
 
 #include "dmx/dmx.h"
@@ -20,42 +42,98 @@
 #include "rom/ets_sys.h"
 #include <string.h>
 
+/** @brief Тег для логирования ESP-IDF */
 static const char *TAG = "DMX";
 
 /* ===== UART константы ===== */
 
+/** @brief Скорость передачи UART для DMX512 (250000 бод) */
 #define UART_BAUD_RATE       250000
+
+/**
+ * @brief Количество циклов для подавления дребезга break-сигнала
+ * @details Используется для предотвращения ложных срабатываний при коротких break.
+ *          Значение 160000 циклов соответствует примерно 1-2 мс при частоте CPU 240 МГц.
+ */
 #define BREAK_DEBOUNCE_CYCLES 160000
+
+/**
+ * @brief Маска флагов прерываний для RX UART
+ * @details Включает прерывания:
+ *   - UART_BRK_DET_INT_ENA — обнаружение break-сигнала
+ *   - UART_FRM_ERR_INT_ENA — ошибка формата кадра
+ *   - UART_RXFIFO_FULL_INT_ENA — заполнение RX FIFO
+ *   - UART_RXFIFO_OVF_INT_ENA — переполнение RX FIFO
+ */
 #define RX_ISR_FLAGS (UART_BRK_DET_INT_ENA | UART_FRM_ERR_INT_ENA | \
                       UART_RXFIFO_FULL_INT_ENA | UART_RXFIFO_OVF_INT_ENA)
 
+/**
+ * @brief Массив указателей на регистры UART для каждого порта
+ * @details Используется для прямого доступа к регистрам UART1 и UART2.
+ *          Помещен в IRAM для быстрого доступа из ISR.
+ */
 static IRAM_ATTR uart_dev_t *uart_hw[] = { &UART1, &UART2 };
 
 /* ===== RX context ===== */
 
+/**
+ * @brief Контекст приема DMX для одного порта
+ * @details Содержит все необходимые данные для обработки DMX кадров,
+ *          включая буферы данных, состояние конечного автомата и ресурсы FreeRTOS.
+ */
 typedef struct {
-    uint8_t           rx_active[DMX_FRAME_LEN];
-    uint8_t           rx_done[DMX_FRAME_LEN];
-    volatile uint16_t frame_len;
-    volatile uint16_t frame_len_saved;
-    volatile bool     enabled;
-    volatile bool     sync;
-    bool              in_frame;
-    uint32_t          last_break_cyc;
-    intr_handle_t     intr_handle;
-    TaskHandle_t      notify_task;
-    int               uart_num;
-    int               rx_pin;
-    int               tx_pin;
-    int               dir_pin;
-    int               fifo_thr;
-    portMUX_TYPE      mux;
+    uint8_t           rx_active[DMX_FRAME_LEN];  /**< Активный буфер приема — заполняется ISR во время получения кадра */
+    uint8_t           rx_done[DMX_FRAME_LEN];    /**< Буфер завершенного кадра — копируется из rx_active после получения */
+    volatile uint16_t frame_len;                  /**< Текущая длина принимаемого кадра (в байтах) */
+    volatile uint16_t frame_len_saved;            /**< Длина последнего завершенного кадра */
+    volatile bool     enabled;                    /**< Флаг включения приема на данном порту */
+    volatile bool     sync;                       /**< Флаг синхронизации — true после первого break, когда данные могут быть скопированы */
+    bool              in_frame;                   /**< Флаг нахождения в процессе приема кадра (после break) */
+    uint32_t          last_break_cyc;             /**< Временная метка последнего break в циклах CPU (для подавления дребезга) */
+    intr_handle_t     intr_handle;                /**< Дескриптор прерывания UART */
+    TaskHandle_t      notify_task;                /**< Дескриптор задачи для уведомления о завершении кадра */
+    int               uart_num;                   /**< Номер UART (UART_NUM_1 или UART_NUM_2) */
+    int               rx_pin;                     /**< GPIO пин приемника (UART RX) */
+    int               tx_pin;                     /**< GPIO пин передатчика (UART TX) */
+    int               dir_pin;                    /**< GPIO пин управления направлением (RS485 DE/RE), -1 если не используется */
+    int               fifo_thr;                   /**< Порог заполнения FIFO для генерации прерывания */
+    portMUX_TYPE      mux;                        /**< Мьютекс для безопасного доступа к буферам из ISR и задач */
 } dmx_rx_ctx_t;
 
+/** @brief Массив контекстов приема для двух портов */
 static dmx_rx_ctx_t s_ctx[2];
 
 /* ===== RX: ISR ===== */
 
+/**
+ * @brief ISR обработки прерываний UART для приема DMX
+ * @param arg Порт (0 или 1), переданный как void*
+ * @details Конечный автомат обнаружения DMX кадров:
+ *
+ * 1. UART_RXFIFO_FULL_INT_ST — заполнение RX FIFO:
+ *    - Читает все байты из FIFO
+ *    - Если в процессе приема кадра (in_frame) и длина не превышает DMX_FRAME_LEN,
+ *      сохраняет байты в rx_active
+ *    - Иначе отбрасывает байты
+ *
+ * 2. UART_BRK_DET_INT_ST — обнаружение break-сигнала (начало нового кадра):
+ *    - Проверка дребезга: если с момента последнего break прошло менее BREAK_DEBOUNCE_CYCLES,
+ *      break отбрасывается
+ *    - Если был предыдущий кадр (in_frame и frame_len > 0):
+ *      * Первый break: устанавливает sync = true (начало синхронизации)
+ *      * Второй и последующие break: копирует данные в rx_done, уведомляет задачу
+ *    - Сбрасывает состояние для нового кадра
+ *
+ * 3. UART_FRM_ERR_INT_ST — ошибка формата кадра:
+ *    - Просто очищает флаг ошибки
+ *
+ * 4. UART_RXFIFO_OVF_INT_ST — переполнение RX FIFO:
+ *    - Сбрасывает состояние приема (in_frame = false, frame_len = 0)
+ *    - Очищает FIFO
+ *
+ * @note Функция размещена в IRAM для быстрого доступа из ISR.
+ */
 static void IRAM_ATTR uart_rx_isr(void *arg) {
     int port = (int)arg;
     dmx_rx_ctx_t *ctx = &s_ctx[port];
@@ -126,8 +204,24 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
 
 /* ===== RX: задача ===== */
 
+/** @brief Указатель на callback-функцию обработки полученных кадров */
 static dmx_frame_cb_t s_frame_callback = NULL;
 
+/**
+ * @brief Задача обработки полученных DMX кадров
+ * @param arg Порт (0 или 1), переданный как void*
+ * @details Задача работает в бесконечном цикле, ожидая уведомления от ISR.
+ *          При получении уведомления:
+ *    1. Проверяет, включен ли прием на данном порту
+ *    2. Копирует данные из rx_done в локальный буфер (с защитой от прерываний)
+ *    3. Сохраняет данные в g_raw_frames[port] с временной меткой
+ *    4. Если кадр достаточно длинный (>= 100 байт), вычисляет контрольные суммы
+ *       и сохраняет их в g_ck_rings[port]
+ *    5. Устанавливает соответствующий бит в g_dmx_events для уведомления других задач
+ *    6. Вызывает registered callback-функцию, если она зарегистрирована
+ *
+ * @note Задача создается с приоритетом 4 и привязана к ядру CPU, соответствующему порту.
+ */
 static void dmx_rx_task(void *arg) {
     int port = (int)arg;
     dmx_rx_ctx_t *ctx = &s_ctx[port];
@@ -168,6 +262,21 @@ static void dmx_rx_task(void *arg) {
 
 /* ===== RX: enable/disable ===== */
 
+/**
+ * @brief Включение/отключение приема DMX на указанном порту
+ * @param port Номер порта (0 или 1)
+ * @param enable true — включить прием, false — отключить
+ * @details При включении:
+ *    - Сбрасывает RX FIFO
+ *    - Сбрасывает состояние конечного автомата
+ *    - Включает прерывания UART
+ *
+ *    При отключении:
+ *    - Отключает прерывания UART
+ *    - Сбрасывает RX FIFO
+ *
+ * @note Функция используется при переключении режимов работы.
+ */
 static void dmx_rx_enable(int port, bool enable) {
     dmx_rx_ctx_t *ctx = &s_ctx[port];
     uart_dev_t *hw = uart_hw[port];
@@ -187,6 +296,17 @@ static void dmx_rx_enable(int port, bool enable) {
 
 /* ===== RX: init ===== */
 
+/**
+ * @brief Инициализация контекста приема для одного порта
+ * @param port Номер порта (0 или 1)
+ * @param rx_pin GPIO пин приемника (UART RX)
+ * @param tx_pin GPIO пин передатчика (UART TX)
+ * @param dir_pin GPIO пин управления направлением (RS485 DE/RE), -1 если не используется
+ * @param uart_num Номер UART (UART_NUM_1 или UART_NUM_2)
+ * @param fifo_thr Порог заполнения FIFO для генерации прерывания
+ * @details Заполняет структуру dmx_rx_ctx_t начальными значениями.
+ *          Не настраивает UART — это делается в dmx_rx_start().
+ */
 static void dmx_rx_init_port(int port, int rx_pin, int tx_pin, int dir_pin,
                               int uart_num, int fifo_thr) {
     memset(&s_ctx[port], 0, sizeof(dmx_rx_ctx_t));
@@ -199,6 +319,20 @@ static void dmx_rx_init_port(int port, int rx_pin, int tx_pin, int dir_pin,
     portMUX_INITIALIZE(&s_ctx[port].mux);
 }
 
+/**
+ * @brief Запуск приема DMX на обоих портах
+ * @details Выполняет полную настройку UART для обоих портов:
+ *    1. Создает группу событий g_dmx_events
+ *    2. Настраивает UART с параметрами DMX512 (250000, 8N2)
+ *    3. Устанавливает GPIO пины для RX и TX
+ *    4. Настраивает порог FIFO и сбрасывает буфер
+ *    5. Регистрирует ISR обработчик прерываний
+ *    6. Включает прерывания UART
+ *    7. Настраивает GPIO пин управления направлением (если указан)
+ *    8. Создает задачу приема для каждого порта
+ *
+ * @note Функция вызывается из dmx_init() после инициализации контекстов.
+ */
 static void dmx_rx_start(void) {
     g_dmx_events = xEventGroupCreate();
 
@@ -250,6 +384,27 @@ static void dmx_rx_start(void) {
 
 /* ===== TX: HAL ===== */
 
+/**
+ * @brief Отправка DMX кадра через UART (HAL-уровень)
+ * @param port Номер порта (0 или 1)
+ * @param data Указатель на данные для отправки (включая старт-код)
+ * @param len Длина данных для отправки в байтах
+ * @return true всегда (для совместимости с интерфейсом)
+ * @details Реализует полный цикл передачи DMX кадра:
+ *    1. Генерация break-сигнала:
+ *       - Устанавливает txd_inv = 1 (инверсия TX) на 176 мкс (минимум 88 мкс для DMX)
+ *       - Устанавливает txd_inv = 0 (возврат к норме) на 16 мкс (マーキング time)
+ *    2. Заполнение TX FIFO:
+ *       - Читает количество свободных байтов в FIFO (максимум 128)
+ *       - Заполняет FIFO порциями по.available bytes
+ *       - Ждет 10 мкс между порциями, если FIFO заполнено
+ *    3. Ожидание завершения передачи:
+ *       - Ждет установки флага UART_TX_DONE_INT_ST
+ *       - Очищает флаг
+ *
+ * @note Функция блокирующая — ждет завершения передачи всех данных.
+ * @note Break-сигнал генерируется путем инверсии линии TX (txd_inv = 1).
+ */
 static bool dmx_hal_send(int port, const uint8_t *data, int len) {
     uart_dev_t *hw = (port == 0) ? (&UART1) : (&UART2);
 
@@ -276,6 +431,29 @@ static bool dmx_hal_send(int port, const uint8_t *data, int len) {
 
 /* ===== TX: задача ===== */
 
+/**
+ * @brief Задача передачи DMX данных
+ * @param arg Не используется (NULL)
+ * @details Задача работает в бесконечном цикле, обрабатывая три режима:
+ *
+ * 1. DMX_MODE_TESTER (режим тестера):
+ *    - Формирует DMX кадр с указанными параметрами (порт, канал, RGB, режим)
+ *    - В TX_MODE_POINT: заполняет одну тройку каналов (R, G, B) на указанном канале
+ *    - В TX_MODE_FILL: заполняет несколько тройек каналов подряд (от 1 до tx_count)
+ *    - Отправляет кадр на указанный порт (или оба, если tx_port >= DMX_PORT_COUNT)
+ *    - Обеспечивает частоту 30 Гц (33.333 мкс между кадрами)
+ *
+ * 2. DMX_MODE_PATCH (режим проходного):
+ *    - Отправляет пустой кадр (все нули) на указанный порт
+ *    - Данные для передачи заполняются извне через dmx_write()
+ *    - Обеспечивает частоту 30 Гц
+ *
+ * 3. DMX_MODE_SNIFFER (режим подслушивания) или другой:
+ *    - Задача просто ждет 100 мс (не потребляя ресурсы CPU)
+ *
+ * @note Задача создается с приоритетом 5 и привязана к ядру CPU 1.
+ * @note При переключении режимов добавляется задержка 100 мс для стабилизации.
+ */
 static void dmx_tx_task(void *arg) {
     uint8_t frame[DMX_CHANNELS + 1];
     dmx_mode_t prev_mode = DMX_MODE_SNIFFER;
@@ -351,6 +529,19 @@ static void dmx_tx_task(void *arg) {
 
 /* ===== Глобалы ===== */
 
+/**
+ * @brief Глобальное состояние DMX модуля
+ * @details Инициализируется начальными значениями:
+ *   - mode: DMX_MODE_SNIFFER (режим подслушивания)
+ *   - tx_port: 0 (первый порт)
+ *   - tx_channel: 1 (начальный канал)
+ *   - tx_r, tx_g, tx_b: 255 (белый цвет)
+ *   - tx_mode: TX_MODE_POINT (точечный режим)
+ *   - tx_count: 3 (количество тройки каналов для заполнения)
+ *   - last_rx_ms: {0, 0} (нет приема)
+ *   - patch_cursor: 0 (начало вселенной)
+ *   - patch_universe: 1 (первая вселенная)
+ */
 dmx_state_t g_dmx = {
     .mode                = DMX_MODE_SNIFFER,
     .tx_port             = 0,
@@ -358,34 +549,77 @@ dmx_state_t g_dmx = {
     .tx_r                = 255, .tx_g = 255, .tx_b = 255,
     .tx_mode             = TX_MODE_POINT,
     .tx_count            = 3,
-    .channel_order       = CH_ORDER_RGB,
-    .fallback_r          = 0, .fallback_g = 0, .fallback_b = 255,
-    .fallback_timeout_ms = 100,
     .last_rx_ms          = { 0, 0 },
     .patch_cursor        = 0,
     .patch_universe      = 1,
 };
 
+/**
+ * @brief Группа событий для уведомления о получении DMX кадров
+ * @details Создается в dmx_rx_start(). Используется FreeRTOS EventGroup.
+ */
 EventGroupHandle_t g_dmx_events;
+
+/**
+ * @brief Массив последних полученных DMX кадров
+ * @details Индекс 0 — порт 1, индекс 1 — порт 2.
+ *          Заполняется в dmx_rx_task().
+ */
 dmx_raw_frame_t    g_raw_frames[2];
+
+/**
+ * @brief Массив кольцевых буферов контрольных сумм
+ * @details Индекс 0 — порт 1, индекс 1 — порт 2.
+ *          Заполняется в dmx_rx_task() для кадров длиной >= 100 байт.
+ */
 dmx_ck_ring_t      g_ck_rings[2];
+
+/**
+ * @brief Счетчик прерываний для каждого порта
+ * @details Увеличивается в uart_rx_isr() при каждом срабатывании прерывания.
+ */
 volatile uint32_t  g_isr_count[2]   = {0, 0};
+
+/**
+ * @brief Счетчик обнаруженных break-сигналов для каждого порта
+ * @details Увеличивается в uart_rx_isr() при обнаружении break (начало нового кадра).
+ */
 volatile uint32_t  g_break_count[2] = {0, 0};
 
+/** @brief Мьютекс для доступа к глобальным данным DMX */
 static SemaphoreHandle_t g_dmx_mutex = NULL;
 
 /* ===== Lock / Unlock ===== */
 
+/**
+ * @brief Захват мьютекса для доступа к глобальным данным DMX
+ * @details Блокирует доступ к g_dmx и другим общим данным.
+ *          Если мьютекс не создан, функция ничего не делает.
+ */
 void dmx_lock(void) {
     if (g_dmx_mutex) xSemaphoreTake(g_dmx_mutex, portMAX_DELAY);
 }
 
+/**
+ * @brief Освобождение мьютекса для доступа к глобальным данным DMX
+ * @details Разблокирует доступ к g_dmx и другим общим данным.
+ *          Если мьютекс не создан, функция ничего не делает.
+ */
 void dmx_unlock(void) {
     if (g_dmx_mutex) xSemaphoreGive(g_dmx_mutex);
 }
 
 /* ===== Публичный API ===== */
 
+/**
+ * @brief Чтение данных из последнего полученного DMX кадра
+ * @param port Номер порта (0 или 1)
+ * @param buf Указатель на буфер для чтения данных
+ * @param len Максимальное количество байт для чтения
+ * @details Читает данные каналов DMX из g_raw_frames[port].data.
+ *          Данные копируются с защитой от конкурентного доступа через мьютекс.
+ *          Если порт недействителен, функция ничего не делает.
+ */
 void dmx_read(int port, uint8_t *buf, int len) {
     if (port < 0 || port >= DMX_PORT_COUNT) return;
     int n = len < DMX_CHANNELS ? len : DMX_CHANNELS;
@@ -394,15 +628,44 @@ void dmx_read(int port, uint8_t *buf, int len) {
     dmx_unlock();
 }
 
+/**
+ * @brief Отправка DMX кадра на указанный порт
+ * @param port Номер порта (0 или 1)
+ * @param frame Указатель на массив данных для отправки (включая старт-код)
+ * @param len Длина данных для отправки в байтах
+ * @details Отправляет данные через UART с генерацией break-сигнала.
+ *          Функция блокирующая — ждет завершения передачи.
+ *          Если порт недействителен, функция ничего не делает.
+ */
 void dmx_write(int port, const uint8_t *frame, int len) {
     if (port < 0 || port >= DMX_PORT_COUNT) return;
     dmx_hal_send(port, frame, len);
 }
 
+/**
+ * @brief Регистрация callback-функции для обработки полученных DMX кадров
+ * @param cb Указатель на callback-функцию или NULL для отмены регистрации
+ * @details Функция вызывается из контекста задачи dmx_rx_task после обработки кадра.
+ *          Регистрация нового callback заменяет предыдущий.
+ */
 void dmx_on_frame(dmx_frame_cb_t cb) {
     s_frame_callback = cb;
 }
 
+/**
+ * @brief Установка режима работы DMX модуля
+ * @param m Режим работы (DMX_MODE_SNIFFER, DMX_MODE_TESTER, DMX_MODE_PATCH)
+ * @details Переключает режим работы модуля:
+ *    - При переключении в TESTER или PATCH:
+ *      * Отключается прием на обоих портах
+ *      * Устанавливается направление передачи (DIR = 1)
+ *    - При переключении в SNIFFER:
+ *      * Включается прием на обоих портах
+ *      * Устанавливается направление приема (DIR = 0)
+ *    - Изменение режима логируется через ESP_LOGI
+ *
+ * @note Изменение режима требует времени для стабилизации UART.
+ */
 void dmx_set_mode(dmx_mode_t m) {
     bool tx_mode = (m == DMX_MODE_TESTER || m == DMX_MODE_PATCH);
 
@@ -428,6 +691,22 @@ void dmx_set_mode(dmx_mode_t m) {
              m == DMX_MODE_TESTER  ? "TESTER"  : "PATCH", dir);
 }
 
+/**
+ * @brief Инициализация DMX модуля
+ * @param tx1 GPIO пин передатчика первого порта (UART1 TX)
+ * @param tx2 GPIO пин передатчика второго порта (UART2 TX)
+ * @param rx1 GPIO пин приемника первого порта (UART1 RX)
+ * @param rx2 GPIO пин приемника второго порта (UART2 RX)
+ * @param dir GPIO пин управления направлением (RS485 DE/RE), -1 если не используется
+ * @details Выполняет полную инициализацию модуля:
+ *    1. Создает мьютекс g_dmx_mutex
+ *    2. Инициализирует контексты приема для обоих портов
+ *    3. Запускает прием на обоих портах (UART, ISR, задачи)
+ *    4. Создает задачу передачи
+ *
+ * @note Порт 1 (UART1) всегда инициализируется, порт 2 (UART2) — опционально.
+ * @note Задача передачи создается с приоритетом 5 на ядре CPU 1.
+ */
 void dmx_init(int tx1, int tx2, int rx1, int rx2, int dir) {
     g_dmx_mutex = xSemaphoreCreateMutex();
 
