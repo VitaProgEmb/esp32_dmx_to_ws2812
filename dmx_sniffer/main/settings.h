@@ -23,6 +23,40 @@
 
 #pragma once
 
+#include "sdkconfig.h"
+
+/* ========================================================================
+ * ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ
+ * ======================================================================== */
+
+/**
+ * @def TARGET_ESP32S3
+ * @brief Макрос определения платформы ESP32-S3.
+ *
+ * Автоматически определяется по IDF-конфигурации. Используется
+ * для условной компиляции GPIO-пинов и периферии.
+ */
+#if CONFIG_IDF_TARGET_ESP32S3
+  #define TARGET_ESP32S3 1
+#else
+  #define TARGET_ESP32S3 0
+#endif
+
+/**
+ * @def USE_W5500
+ * @brief Включение поддержки Ethernet W5500.
+ *
+ * Установите в 1 для включения W5500 Ethernet на плате ESP32-S3.
+ * Требует подключения W5500 по SPI (MOSI/MISO/SCK/CS/INT).
+ *
+ * @note Работает только на ESP32-S3 (TARGET_ESP32S3 = 1).
+ */
+#if TARGET_ESP32S3
+  #define USE_W5500 1
+#else
+  #define USE_W5500 0
+#endif
+
 /* ========================================================================
  * НАСТРОЙКИ СЕТИ WI-FI
  * ======================================================================== */
@@ -134,6 +168,23 @@
  * @{
  */
 
+/* ========================================================================
+ * ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ (TARGET_ESP32S3)
+ * ======================================================================== */
+
+#if TARGET_ESP32S3
+  /* --- ESP32-S3 DevKitC --- */
+  #define BOOT_BUTTON_GPIO       0
+  #define STATUS_LED_GPIO        48   /* Встроенный RGB LED (красный) */
+  #define RGB_LED_R              48
+  #define RGB_LED_G              47
+  #define RGB_LED_B              21
+#else
+  /* --- ESP32 (оригиналь) --- */
+  #define BOOT_BUTTON_GPIO       0
+  #define STATUS_LED_GPIO        12
+#endif
+
 /**
  * @def BOOT_BUTTON_GPIO
  * @brief GPIO-вывод кнопки BOOT на плате ESP32.
@@ -143,7 +194,6 @@
  *
  * @note На платах ESP32 DevKit кнопка BOOT обычно уже подключена к GPIO 0.
  */
-#define BOOT_BUTTON_GPIO       0
 
 /**
  * @def STATUS_LED_GPIO
@@ -156,7 +206,6 @@
  *
  * @note Рекомендуется использовать встроенный LED платы (обычно GPIO 2 или 12).
  */
-#define STATUS_LED_GPIO        12
 
 /** @} */ /* конец группы управления */
 
@@ -284,6 +333,22 @@
  * @{
  */
 
+#if TARGET_ESP32S3
+  /* --- ESP32-S3 --- */
+  #define DMX_GPIO_RX1           15
+  #define DMX_GPIO_TX1           16
+  #define DMX_GPIO_RX2           17
+  #define DMX_GPIO_TX2           18
+  #define DMX_GPIO_DIR2          21
+#else
+  /* --- ESP32 (оригиналь) --- */
+  #define DMX_GPIO_RX1           15
+  #define DMX_GPIO_TX1           2
+  #define DMX_GPIO_RX2           16
+  #define DMX_GPIO_TX2           17
+  #define DMX_GPIO_DIR2          27
+#endif
+
 /**
  * @def DMX_GPIO_RX1
  * @brief GPIO-вывод приёма (RX) для первого DMX-порта.
@@ -291,7 +356,6 @@
  * Подключается к выходу приёмника RS-485 (например, MAX485).
  * DMX-сигнал поступает на этот вывод от контроллера/светового прибора.
  */
-#define DMX_GPIO_RX1           15
 
 /**
  * @def DMX_GPIO_TX1
@@ -300,7 +364,6 @@
  * Подключается к входу передатчика RS-485 (например, MAX485).
  * Используется для отправки DMX-контролей обратно в сеть.
  */
-#define DMX_GPIO_TX1           2
 
 /**
  * @def DMX_GPIO_RX2
@@ -308,7 +371,6 @@
  *
  * Аналогично DMX_GPIO_RX1, но для второго физического DMX-входа.
  */
-#define DMX_GPIO_RX2           16
 
 /**
  * @def DMX_GPIO_TX2
@@ -316,7 +378,6 @@
  *
  * Аналогично DMX_GPIO_TX1, но для второго DMX-выхода.
  */
-#define DMX_GPIO_TX2           17
 
 /**
  * @def DMX_GPIO_DIR2
@@ -327,7 +388,6 @@
  *   - LOW: приём (RX активен).
  * Используется для порта 2 (порт 1 не имеет управления направлением).
  */
-#define DMX_GPIO_DIR2          27
 
 /** @} */ /* конец группы DMX-портов */
 
@@ -340,6 +400,34 @@
  * @{
  */
 
+#if TARGET_ESP32S3
+  /* --- ESP32-S3 --- */
+  #define LED_STRIP_GPIO         38
+  #define LED_STRIP_GPIO2        39
+#else
+  /* --- ESP32 (оригиналь) --- */
+  #define LED_STRIP_GPIO         23
+  #define LED_STRIP_GPIO2        5
+#endif
+
+/* ========================================================================
+ * НАСТРОЙКИ ETHERNET W5500 (только ESP32-S3)
+ * ======================================================================== */
+
+#if USE_W5500
+  /**
+   * @name SPI-пины для W5500 Ethernet
+   * @{
+   */
+  #define W5500_SPI_MOSI         11
+  #define W5500_SPI_MISO         13
+  #define W5500_SPI_SCK          12
+  #define W5500_SPI_CS           10
+  #define W5500_SPI_INT          9
+  #define W5500_SPI_RST          -1  /* RST подтянут к VCC, не используется */
+  /** @} */
+#endif
+
 /**
  * @def LED_STRIP_GPIO
  * @brief GPIO-вывод для передачи данных на первую LED-ленту WS2812B (Strip 1).
@@ -347,7 +435,6 @@
  * Подключается к DIN (Data In) первой светодиодной ленты.
  * Данные передаются через RMT TX с разрешением 10 МГц.
  */
-#define LED_STRIP_GPIO         23
 
 /**
  * @def LED_STRIP_GPIO2
@@ -356,7 +443,6 @@
  * Подключается к DIN второй светодиодной ленты. Используется при работе
  * в параллельном или последовательном режиме двух лент.
  */
-#define LED_STRIP_GPIO2        5
 
 /**
  * @def LED_STRIP_MAX_LEDS

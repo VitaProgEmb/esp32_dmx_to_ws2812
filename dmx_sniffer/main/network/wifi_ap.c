@@ -26,6 +26,16 @@
 #include "lwip/ip_addr.h"
 #include <string.h>
 
+#if USE_W5500
+#include "esp_eth.h"
+#include "esp_netif.h"
+#include "esp_eth_mac.h"
+#include "esp_eth_phy.h"
+#include "esp_eth_mac_spi.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#endif
+
 /** @brief Тег логирования ESP-IDF для модуля Wi-Fi */
 static const char *TAG = "WIFI";
 
@@ -230,23 +240,84 @@ static void status_led_task(void *arg) {
     }
 }
 
+#if USE_W5500
 /**
- * @brief Инициализирует сетевой стек
+ * @brief Инициализирует Ethernet W5500 через SPI
  *
- * Главная точка входа для модуля сети. Порядок критичен:
- * 1. wifi_init() — инициализация Wi-Fi драйвера (без запуска)
- * 2. status_led_task — запуск задачи мигания LED (на ядре 0)
- * 3. web_server_init() — запуск HTTP-сервера
- *
- * @note Wi-Fi остаётся выключенным после вызова.
- *       Для включения нужно вызвать wifi_toggle() или wifi_start()
- *       из обработчика пользовательского ввода (кнопка, UART).
+ * Настраивает SPI-шину и инициализирует Ethernet MAC через esp_eth.
+ * W5500 подключается к ESP32-S3 по SPI (MOSI/MISO/SCK/CS/INT).
  *
  * @return ESP_OK при успешной инициализации
  */
+static esp_err_t w5500_init(void) {
+    ESP_LOGI(TAG, "W5500 Ethernet init");
+
+    /* 1. Конфигурация SPI-шины */
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num   = W5500_SPI_MOSI,
+        .miso_io_num   = W5500_SPI_MISO,
+        .sclk_io_num   = W5500_SPI_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+    /* 2. Конфигурация SPI-устройства (CS) */
+    spi_device_interface_config_t spi_devcfg = {
+        .mode = 0,
+        .clock_speed_hz = 25 * 1000 * 1000,  /* 25 МГц */
+        .spics_io_num = W5500_SPI_CS,
+        .queue_size = 20,
+    };
+
+    /* 3. Создание MAC W5500 */
+    eth_w5500_config_t w5500_cfg = ETH_W5500_DEFAULT_CONFIG(SPI2_HOST, &spi_devcfg);
+    w5500_cfg.int_gpio_num = W5500_SPI_INT;
+    w5500_cfg.poll_period_ms = 10;
+
+    eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+    mac_cfg.rx_task_stack_size = 4096;
+    mac_cfg.rx_task_prio = 5;
+
+    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg);
+
+    /* 4. Создание PHY W5500 */
+    eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
+    phy_cfg.phy_addr = 1;
+
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
+
+    /* 5. Установка драйвера Ethernet */
+    esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &eth_handle));
+
+    /* 6. Привязка к TCP/IP стеку */
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
+
+    /* 7. Запуск Ethernet */
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    ESP_LOGI(TAG, "W5500 Ethernet started");
+    return ESP_OK;
+}
+#endif
+
+#if USE_W5500
+esp_err_t network_init(void) {
+    w5500_init();
+    xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
+    web_server_init();
+    return ESP_OK;
+}
+#else
 esp_err_t network_init(void) {
     wifi_init();
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
     web_server_init();
     return ESP_OK;
 }
+#endif

@@ -22,4 +22,5 @@ idf_component_register(SRCS
         esp_timer
         app_update
         lwip
+        esp_eth
 )

@@ -38,6 +38,13 @@
 #include "driver/uart.h"
 #include "hal/uart_ll.h"
 #include "soc/uart_struct.h"
+#include "soc/interrupts.h"
+
+#if CONFIG_IDF_TARGET_ESP32S3
+  #define UART_FIFO_READ(hw) ((hw)->fifo.rxfifo_rd_byte)
+#else
+  #define UART_FIFO_READ(hw) ((hw)->fifo.rw_byte)
+#endif
 #include "soc/uart_reg.h"
 #include "rom/ets_sys.h"
 #include <string.h>
@@ -149,9 +156,9 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             hw->int_clr.val = UART_RXFIFO_FULL_INT_CLR;
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0) {
                 if (ctx->in_frame && ctx->frame_len < DMX_FRAME_LEN)
-                    ctx->rx_active[ctx->frame_len++] = hw->fifo.rw_byte;
+                    ctx->rx_active[ctx->frame_len++] = UART_FIFO_READ(hw);
                 else
-                    (void)hw->fifo.rw_byte;
+                    (void)UART_FIFO_READ(hw);
             }
         }
 
@@ -161,7 +168,7 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             if (ctx->last_break_cyc != 0 &&
                 (now - ctx->last_break_cyc) < BREAK_DEBOUNCE_CYCLES) {
                 while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0)
-                    (void)hw->fifo.rw_byte;
+                    (void)UART_FIFO_READ(hw);
                 continue;
             }
             ctx->last_break_cyc = now;
@@ -169,9 +176,9 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
 
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0 &&
                    ctx->frame_len < DMX_FRAME_LEN)
-                ctx->rx_active[ctx->frame_len++] = hw->fifo.rw_byte;
+                ctx->rx_active[ctx->frame_len++] = UART_FIFO_READ(hw);
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0)
-                (void)hw->fifo.rw_byte;
+                (void)UART_FIFO_READ(hw);
 
             if (ctx->in_frame && ctx->frame_len > 0) {
                 if (!ctx->sync) {
@@ -197,7 +204,7 @@ static void IRAM_ATTR uart_rx_isr(void *arg) {
             ctx->in_frame = false;
             ctx->frame_len = 0;
             while (HAL_FORCE_READ_U32_REG_FIELD(hw->status, rxfifo_cnt) > 0)
-                (void)hw->fifo.rw_byte;
+                (void)UART_FIFO_READ(hw);
         }
     }
 }
