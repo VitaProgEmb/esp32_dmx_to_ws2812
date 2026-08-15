@@ -24,16 +24,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/ip_addr.h"
+#include "mdns.h"
 #include <string.h>
 
 #if USE_W5500
-#include "esp_eth.h"
-#include "esp_netif.h"
-#include "esp_eth_mac.h"
-#include "esp_eth_phy.h"
-#include "esp_eth_mac_spi.h"
-#include "driver/spi_master.h"
-#include "driver/gpio.h"
+#include "w5500.h"
 #endif
 
 /** @brief Тег логирования ESP-IDF для модуля Wi-Fi */
@@ -45,15 +40,12 @@ static bool s_wifi_enabled = false;
 /**
  * @brief Обработчик событий Wi-Fi и IP
  *
- * Обрабатывает два типа событий:
- * - WIFI_EVENT: STA_START → автоматическое подключение;
- *   STA_DISCONNECTED → повторная попытка подключения (если WiFi включён)
- * - IP_EVENT: STA_GOT_IP → логирование полученного IP-адреса
+ * Обрабатывает WIFI_EVENT и IP_EVENT (только STA):
+ * - STA_START → автоматическое подключение
+ * - STA_DISCONNECTED → повторная попытка (если WiFi включён)
+ * - STA_GOT_IP → логирование IP-адреса
  *
- * @param[in] arg   пользовательский аргумент (не используется)
- * @param[in] base  база события (WIFI_EVENT или IP_EVENT)
- * @param[in] id    идентификатор события
- * @param[in] data  данные события (ip_event_got_ip_t для IP_EVENT)
+ * @note ETH_EVENT и IP_EVENT_ETH_GOT_IP обрабатываются в w5500.c
  */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data) {
@@ -63,9 +55,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
             if (s_wifi_enabled) esp_wifi_connect();
         }
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = data;
-        ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+    } else if (base == IP_EVENT) {
+        if (id == IP_EVENT_STA_GOT_IP) {
+            ip_event_got_ip_t *ev = data;
+            ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        }
     }
 }
 
@@ -89,8 +83,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
  * @return ESP_OK при успешной инициализации
  */
 static esp_err_t wifi_init(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_init();
+    esp_event_loop_create_default();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -240,75 +234,47 @@ static void status_led_task(void *arg) {
     }
 }
 
-#if USE_W5500
 /**
- * @brief Инициализирует Ethernet W5500 через SPI
+ * @brief Инициализирует mDNS и регистрирует HTTP-сервис
  *
- * Настраивает SPI-шину и инициализирует Ethernet MAC через esp_eth.
- * W5500 подключается к ESP32-S3 по SPI (MOSI/MISO/SCK/CS/INT).
- *
- * @return ESP_OK при успешной инициализации
+ * Устройство доступно по адресу http://<MDNS_HOSTNAME>.local
  */
-static esp_err_t w5500_init(void) {
-    ESP_LOGI(TAG, "W5500 Ethernet init");
-
-    /* 1. Конфигурация SPI-шины */
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num   = W5500_SPI_MOSI,
-        .miso_io_num   = W5500_SPI_MISO,
-        .sclk_io_num   = W5500_SPI_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
-
-    /* 2. Конфигурация SPI-устройства (CS) */
-    spi_device_interface_config_t spi_devcfg = {
-        .mode = 0,
-        .clock_speed_hz = 25 * 1000 * 1000,  /* 25 МГц */
-        .spics_io_num = W5500_SPI_CS,
-        .queue_size = 20,
-    };
-
-    /* 3. Создание MAC W5500 */
-    eth_w5500_config_t w5500_cfg = ETH_W5500_DEFAULT_CONFIG(SPI2_HOST, &spi_devcfg);
-    w5500_cfg.int_gpio_num = W5500_SPI_INT;
-    w5500_cfg.poll_period_ms = 10;
-
-    eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
-    mac_cfg.rx_task_stack_size = 4096;
-    mac_cfg.rx_task_prio = 5;
-
-    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg);
-
-    /* 4. Создание PHY W5500 */
-    eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
-    phy_cfg.phy_addr = 1;
-
-    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
-
-    /* 5. Установка драйвера Ethernet */
-    esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
-    esp_eth_handle_t eth_handle = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &eth_handle));
-
-    /* 6. Привязка к TCP/IP стеку */
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
-    esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
-    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
-
-    /* 7. Запуск Ethernet */
-    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
-
-    ESP_LOGI(TAG, "W5500 Ethernet started");
-    return ESP_OK;
+static void mdns_init_service(void) {
+    mdns_init();
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set("DMX Sniffer / Tester");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS: http://%s.local", MDNS_HOSTNAME);
 }
-#endif
 
+/**
+ * @brief Инициализирует сеть: Ethernet/Wi-Fi, mDNS, LED-статус, HTTP-сервер
+ *
+ * Главная точка входа для сетевого стека. Вызывается из app_main()
+ * после инициализации DMX и LED. Порядок важен.
+ *
+ * При USE_W5500=1:
+ *   1. Инициализирует TCP/IP стек и event loop
+ *   2. Пытается запустить W5500 Ethernet
+ *   3. При ошибке — fallback на WiFi
+ *   4. Запускает mDNS, статусную LED, HTTP-сервер
+ *
+ * При USE_W5500=0:
+ *   1. Инициализирует WiFi
+ *   2. Запускает mDNS, статусную LED, HTTP-сервер
+ */
 #if USE_W5500
 esp_err_t network_init(void) {
-    w5500_init();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_err_t err = w5500_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "W5500 init failed, falling back to WiFi");
+        wifi_init();
+    }
+
+    mdns_init_service();
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
     web_server_init();
     return ESP_OK;
@@ -316,6 +282,8 @@ esp_err_t network_init(void) {
 #else
 esp_err_t network_init(void) {
     wifi_init();
+
+    mdns_init_service();
     xTaskCreatePinnedToCore(status_led_task, "status_led", 2048, NULL, 1, NULL, 0);
     web_server_init();
     return ESP_OK;

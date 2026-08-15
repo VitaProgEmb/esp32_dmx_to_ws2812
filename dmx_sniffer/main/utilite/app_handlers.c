@@ -22,6 +22,9 @@
 #include "dmx/dmx_led.h"
 #include "led_strip.h"
 #include "utilite/effects.h"
+#include "esp_log.h"
+
+static const char *TAG = "HANDLERS";
 
 /* ===== Handlers ===== */
 
@@ -158,7 +161,9 @@ void handler_led_mode(bool sequential)  { g_led_mode = sequential ? LED_MODE_SEQ
  *
  * @note Потокобезопасность: защищено @c dmx_lock() / @c dmx_unlock().
  */
-void handler_led_shift(uint8_t shift)   { dmx_lock(); g_led_settings.shift = shift; dmx_unlock(); }
+void handler_led_shift(uint8_t shift)   { 
+     ESP_LOGI(TAG,"shift level:%d",shift);
+     dmx_lock(); g_led_settings.shift = shift; dmx_unlock(); }
 
 /**
  * @brief Обработчик включения/выключения интерполяции цвета.

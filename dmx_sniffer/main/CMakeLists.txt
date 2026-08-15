@@ -10,6 +10,8 @@ idf_component_register(SRCS
     "led_driver/ws2812.c"
     "network/web_server.c"
     "network/wifi_ap.c"
+    "network/w5500.c"
+    "network/w5500_spi_test.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
@@ -23,4 +25,5 @@ idf_component_register(SRCS
         app_update
         lwip
         esp_eth
+        mdns
 )

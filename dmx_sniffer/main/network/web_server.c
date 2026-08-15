@@ -550,6 +550,10 @@ esp_err_t web_server_init(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 24; config.stack_size = 8192;
     config.lru_purge_enable = true; config.send_wait_timeout = 30;
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 10;
+    config.keep_alive_interval = 5;
+    config.keep_alive_count = 3;
     for (int i = 0; i < 3; i++) {
         if (httpd_start(&s_server, &config) == ESP_OK) goto reg;
         ESP_LOGE(TAG, "httpd_start attempt %d failed", i + 1);

@@ -51,6 +51,10 @@
 #include "network/wifi_ap.h"
 #include "utilite/udp_test.h"
 
+#if USE_W5500
+extern void w5500_spi_test(void);
+#endif
+
 /**
  * @brief Главная функция приложения — точка входа ESP-IDF
  *

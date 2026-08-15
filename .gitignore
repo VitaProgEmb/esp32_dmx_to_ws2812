@@ -7,9 +7,16 @@ sdkconfig.old
 .vscode/
 __pycache__/
 
+# ESP-IDF managed components
+managed_components/
+dependencies.lock
+compile_commands.json
+
 # Test files (local only)
 stress_test.cpp
 stress_test.exe
 stress_test.py
 test_device.py
 AccesToken.txt
+monitor.py
+read_serial.py
